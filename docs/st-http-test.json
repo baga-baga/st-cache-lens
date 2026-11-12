@@ -9,9 +9,11 @@
     "nonstream JSON forwarded",
     "Anthropic SSE forwarded",
     "relay usage preserved where ST nonstream omits it",
-    "no credentials in observation records"
+    "no credentials in observation records",
+    "CSRF-protected unsaved Agent model check makes only GET with no generation",
+    "Agent model check preserves zero budget and unsaved configuration"
   ],
-  "passed": 8,
+  "passed": 10,
   "paidApiCalls": 0,
   "providerCacheImprovementVerified": false,
   "syntheticUpstream": true

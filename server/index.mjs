@@ -33,6 +33,7 @@ function route(action, maxBodyBytes = 65536) {
 export async function init(router) {
     router.get('/status', route(service => service.status()));
     router.post('/agent-config', route((service, request) => service.configure(request.body)));
+    router.post('/agent-check', route((service, request) => service.checkAgent(request.body), 8192));
     router.post('/observer-config', route((service, request) => service.configureObserver(request.body)));
     router.post('/agent', route((service, request) => service.run(request.body)));
     router.get('/agent-records', route(async service => { await service.load(); return { records: structuredClone(service.state.records) }; }));

@@ -1,3 +1,4 @@
+import { OPENAI_STARTER, agentSetupError } from './adapters/agent-setup.js';
 import { applyPolicyTransaction, rollbackPolicyTransaction, recoverPolicyIntent, advanceHistoryAfterRollback, rebasePolicyHistory } from './adapters/relay-control.js';
 import { installSTAdapter } from './adapters/st.js';
 import { createBrowserStateStore } from './adapters/state-store.js';
@@ -34,7 +35,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.0</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.1</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <div class="cl-grid">
@@ -74,7 +75,34 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   </details>
   <details><summary>真实观察评估与剧情质量</summary><button data-action="baseline">将当前观察设为基线</button><button data-action="evaluate">比较后续正常游玩</button><label>剧情质量<select data-id="quality"><option value="unknown">尚未评价</option><option value="pass">连续性、事实和秘密条件正常</option><option value="fail">出现剧情退化</option></select></label><pre data-id="evaluation"></pre><p class="cl-note">相同模型 / 用途和币种的可比窗口才作比较。缺 usage 或价格时不宣布节省。无改善或质量退化会停用自动优化，质量退化恢复优化前副本。</p></details>
   <details><summary>稳定记忆适配（独立，可选）</summary><p>现有第三方摘要保持只读。本插件提供追加式记忆台账供明确适配器读取；不会重复注入它，也不自动改写旧摘要。</p><div class="cl-grid"><label>事件 ID<input data-id="eventId"></label><label>准确剧情日期（ISO）<input data-id="eventDate" placeholder="2026-11-12"></label><label>原相对时间措辞<input data-id="eventRelative" placeholder="5天前（原文保留）"></label></div><label>已确认事件<textarea data-id="eventText" rows="2"></textarea></label><button data-action="append-memory">追加事件</button><button data-action="export-memory">导出记忆与档案</button><pre data-id="memory"></pre></details>
-  <details><summary>优化 Agent（可选服务端组件）</summary><p>密钥仅发送到同源酒馆服务端保管，不写入前端设置或导出。默认只上传计数、差异类型、片段 ID 和设置；不上传整本世界书。</p><div class="cl-grid"><label>接口<select data-id="agentType"><option value="openai">OpenAI Chat Completions 兼容</option><option value="anthropic">Anthropic Messages</option></select></label><label>完整 API endpoint<input data-id="agentEndpoint" type="url" placeholder="https://…/v1/chat/completions"></label><label>模型<input data-id="agentModel"></label><label>密钥<input data-id="agentKey" type="password" autocomplete="off" placeholder="留空保留同站点已有密钥"></label><label>最大输出 tokens<input data-id="agentOutput" type="number" value="1024" min="64"></label><label>币种<input data-id="currency" value="USD"></label><label>输入价 / 百万<input data-id="agentInputPrice" type="number" min="0" step="0.01"></label><label>输出价 / 百万<input data-id="agentOutputPrice" type="number" min="0" step="0.01"></label><label>价格来源<input data-id="agentPriceSource" placeholder="服务商价目表 URL"></label><label>价格更新时间<input data-id="agentPriceDate" type="date"></label></div><label>可选缓存价格 JSON（留空表示未知）<textarea data-id="agentCachePrices" rows="2" placeholder='{"cacheRead":0.1}'></textarea></label><label><input data-id="agentLocal" type="checkbox">显式允许本机回环 API</label><button data-action="save-agent">保存服务端配置与预算</button><pre data-id="agentStatus"></pre></details>
+  <details data-id="agentSection"><summary>优化 Agent · 连接与模型设置</summary>
+    <p>按顺序操作：检查服务端 → 填写接口和密钥 → 检查连接 → 设置预算并保存。</p>
+    <div class="cl-toolbar"><button data-action="check-server">1. 检查服务端</button><button data-action="preset-openai">2. 一键填写 OpenAI</button></div>
+    <div data-id="agentConnection" class="cl-status" role="status">尚未检查。只安装前端扩展时，还需要安装一次服务端组件。</div>
+    <details><summary>提示服务端未安装时，怎么处理？</summary><p>先停止酒馆，在 Termux 或电脑终端进入酒馆根目录，执行：</p><code>node data/default-user/extensions/st-cache-lens/scripts/install.mjs --st . --server</code><p>随后在酒馆根目录 config.yaml 中设置 enableServerPlugins: true，再启动酒馆。已安装服务端的用户更新后也执行同一命令。其他用户目录和全局安装见仓库说明。</p></details>
+    <div class="cl-grid cl-agent-grid">
+      <label class="cl-wide">接口<select data-id="agentType"><option value="openai">OpenAI Chat Completions 兼容</option><option value="anthropic">Anthropic Messages</option></select></label>
+      <label class="cl-wide">完整 API 地址<input data-id="agentEndpoint" type="url" placeholder="https://api.openai.com/v1/chat/completions" spellcheck="false"></label>
+      <label class="cl-wide">模型<input data-id="agentModel" placeholder="例如 gpt-6.1-terra" spellcheck="false"></label>
+      <label class="cl-wide">API 密钥<input data-id="agentKey" type="password" autocomplete="off" placeholder="只在这里填写；留空保留同地址已保存密钥"></label>
+    </div>
+    <p class="cl-note">密钥只发送给同源酒馆服务端，不写进前端设置或导出。检查连接只读取模型信息，不发送剧情、不生成内容；不能据此保证余额充足或生成成功。</p>
+    <button data-action="check-agent">3. 检查连接与模型（不生成）</button>
+    <div class="cl-grid">
+      <label>Agent 调用次数上限<input data-id="agentCalls" type="number" min="0" placeholder="未授权时为 0"></label>
+      <label>Agent 总费用上限<input data-id="agentCost" type="number" min="0" step="0.01" placeholder="未授权时为 0"></label>
+      <label>币种<input data-id="currency" value="USD"></label><label>最大输出 tokens<input data-id="agentOutput" type="number" value="1024" min="64" max="8192"></label>
+    </div>
+    <p class="cl-note">预算默认 0，连接检查不需要付费预算。由你填写上限后才允许调用 Agent；保存不会立即调用模型。</p>
+    <details><summary>价格与高级选项（OpenAI 一键填写已包含价格）</summary>
+      <p class="cl-note">OpenAI 预设使用 2026-11-12 核对的标准价格快照，之后可按服务商实际价格更新。中转价格须自行填写。</p>
+      <div class="cl-grid"><label>输入价 / 百万<input data-id="agentInputPrice" type="number" min="0" step="0.001"></label><label>输出价 / 百万<input data-id="agentOutputPrice" type="number" min="0" step="0.001"></label><label class="cl-wide">价格来源<input data-id="agentPriceSource" placeholder="服务商价目表 URL"></label><label>价格更新时间<input data-id="agentPriceDate" type="date"></label><label>推理强度<select data-id="agentReasoning"><option value="default">模型默认</option><option value="none">none</option><option value="low">low（起步配置）</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></label><label>输出限制参数<select data-id="agentTokenParameter"><option value="auto">自动（按实际接口）</option><option value="max_completion_tokens">max_completion_tokens</option><option value="max_tokens">max_tokens</option></select></label></div>
+      <label>可选缓存价格 JSON<textarea data-id="agentCachePrices" rows="2" placeholder='{"cacheRead":0.05}'></textarea></label>
+      <label><input data-id="agentLocal" type="checkbox">显式允许本机回环 API</label>
+    </details>
+    <button data-action="save-agent">4. 保存配置与预算（不调用模型）</button>
+    <div data-id="agentStatus" class="cl-status" role="status">尚未保存。默认只上传诊断计数、差异类型、片段 ID 和设置，不上传整本世界书。</div>
+  </details>
   <details><summary>服务端实际请求与缓存断点</summary><p>安装并启动本地 relay 后，将酒馆该连接的 reverse proxy 指向它。relay 只能证明它实际发送的请求，中转内部二次转换仍不可见。</p><div class="cl-grid"><label>观察器 ID<input data-id="observerId" value="main" placeholder="main 或 summary"></label><label>relay 地址<input data-id="relayURL" value="http://127.0.0.1:8937"></label><label>本地 relay 令牌<input data-id="relayToken" type="password" autocomplete="off"></label></div><button data-action="save-observer">连接本地观察器</button><button data-action="load-policy">读取当前断点策略</button><label>策略 JSON<textarea data-id="policy" rows="8" spellcheck="false"></textarea></label><div class="cl-toolbar"><button data-action="draft-policy">从两次实际请求提取稳定 system 前缀</button><button data-action="apply-policy">应用已核实接口的断点策略</button><button data-action="rollback-policy">恢复上一断点策略</button><button data-action="recover-policy">恢复未完成的策略事务</button></div><label><input type="checkbox" data-id="verifiedEndpoint">我已核对当前上游确实支持该 Anthropic Messages 缓存规则（包括中转兼容性）</label><pre data-id="policyStatus"></pre></details>
   </details>`;
   host.append(root);
@@ -84,7 +112,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   function out(id, val) { $(root, `[data-id="${id}"]`).textContent = typeof val === 'string' ? val : json(val); }
   function status(message, error = false) { const el=$(root,'[data-id="status"]');el.textContent=message;el.classList.toggle('cl-error',error); }
   function syncBoundaryInputs() {
-    for(const [key,id]of [['mode','mode'],['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost'],['currency','currency']])set(id,settings[key]);
+    for(const [key,id]of [['mode','mode'],['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost'],['maxTests','agentCalls'],['maxCost','agentCost'],['currency','currency']])set(id,settings[key]);
   }
   function restoreCommitted() {
     for(const key of Object.keys(settings)) delete settings[key];
@@ -161,9 +189,27 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     out('rules',settings.rules);out('memory',renderMemory(memory));
   }
   function download(name, content) { const url=URL.createObjectURL(new Blob([json(content)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000); }
-  async function api(path,body) { const headers=context.getRequestHeaders?.()||{'Content-Type':'application/json'};const r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body)});if(!r.ok)throw new Error(`可选服务端组件：HTTP ${r.status} ${await r.text()}`);return r.json(); }
+  async function api(path,body) { const headers=context.getRequestHeaders?.()||{'Content-Type':'application/json'};const r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body)});if(!r.ok){let code='';try{const data=await r.json();if(/^[A-Z0-9_]{1,100}$/.test(data.error))code=data.error;}catch{}const error=new Error(agentSetupError(code,r.status));error.code=code;error.httpStatus=r.status;throw error;}return r.json(); }
+  async function checkAgentServer() {
+    serverStatus=await api('status');
+    if(!serverStatus.capabilities?.agentCheck)throw new Error('服务端版本较旧。请执行本栏的安装命令更新服务端并重启酒馆。');
+    out('agentConnection','服务端已就绪（'+serverStatus.serverVersion+'）。可以填写密钥并检查连接。');
+    if(serverStatus.configured){
+      const c=serverStatus.config;
+      if(!value('agentEndpoint').trim()&&!value('agentModel').trim()){
+        const p=c.prices||{};
+        for(const [id,v]of Object.entries({agentType:c.interfaceType,agentEndpoint:c.endpoint,agentModel:c.model,agentOutput:c.maxOutputTokens,currency:p.currency,agentInputPrice:p.input,agentOutputPrice:p.output,agentPriceSource:p.source,agentPriceDate:p.updatedAt,agentTokenParameter:c.tokenParameter||'auto',agentReasoning:c.reasoningEffort||'default'}))set(id,v);
+        set('agentCachePrices',json(Object.fromEntries(Object.entries(p).filter(([key])=>key.startsWith('cache')))));
+        $(root,'[data-id="agentLocal"]').checked=c.allowLocal===true;
+      }
+      out('agentStatus','服务端已有配置：'+c.model+'；密钥已保存在服务端。');
+    }
+    return serverStatus;
+  }
+  function agentConnectionInput() { return {interfaceType:value('agentType'),endpoint:value('agentEndpoint').trim(),model:value('agentModel').trim(),apiKey:value('agentKey'),allowLocal:$(root,'[data-id="agentLocal"]').checked}; }
+
   async function refresh() {
-    serverStatus=await api('status');out('agentStatus',serverStatus);
+    serverStatus=await api('status');out('agentStatus',serverStatus.configured?'已保存 Agent 配置：'+serverStatus.config.model+'。调用仍受预算限制。':'服务端可用，尚未保存 Agent 配置。');
     const jobs=[api('agent-records').then(data=>(data.records||[]).forEach(r=>addRecord(agentObservation(r))))];
     if(serverStatus.observerConfigured)jobs.push(api('relay-records').then(data=>{if(data.errors?.length)status('部分观察器不可用：'+data.errors.map(e=>e.observerId+': '+e.error).join('；'),true);(data.records||data||[]).forEach(r=>{
       const rule=settings.rules.find(v=>v.model===r.model&&(v.provider===r.provider||v.provider===r.interfaceType));
@@ -228,7 +274,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     }).catch(error=>status(error.message,true));
   }
   const actions = {
-    async save(){assertIdle();assertFresh();const proposed={};for(const [key,id]of [['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost']]){const n=Number(value(id));if(!Number.isFinite(n)||n<0||(key!=='maxCost'&&!Number.isSafeInteger(n)))throw new Error('tokens 和次数上限必须是非负整数，费用须是非负数字');proposed[key]=n;}if(proposed.maxInputTokens<1||proposed.contextTokens<=proposed.outputReserveTokens)throw new Error('输入和上下文边界无效');if(!['diagnose','preview','automatic'].includes(value('mode')))throw new Error('未知运行模式');Object.assign(settings,proposed,{mode:value('mode')});await persist();status('已保存边界；自动模式在下一次正常正文完成后，只在已授权副本范围内生成免费本地排序方案。');render();scheduleAutomatic();},
+    async save(){assertIdle();assertFresh();const proposed={};for(const [key,id]of [['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost']]){const n=Number(value(id));if(!Number.isFinite(n)||n<0||(key!=='maxCost'&&!Number.isSafeInteger(n)))throw new Error('tokens 和次数上限必须是非负整数，费用须是非负数字');proposed[key]=n;}if(proposed.maxInputTokens<1||proposed.contextTokens<=proposed.outputReserveTokens)throw new Error('输入和上下文边界无效');if(!['diagnose','preview','automatic'].includes(value('mode')))throw new Error('未知运行模式');Object.assign(settings,proposed,{mode:value('mode')});await persist();syncBoundaryInputs();status('已保存边界；自动模式在下一次正常正文完成后，只在已授权副本范围内生成免费本地排序方案。');render();scheduleAutomatic();},
     async 'add-rule'(){const provider=value('ruleProvider').trim(),model=value('ruleModel').trim();if(!provider||!model)throw new Error('需要接口来源和完整模型 ID');settings.rules=settings.rules.filter(r=>!(r.provider===provider&&r.model===model));settings.rules.push({provider,model,purpose:value('rulePurpose')});for(const r of [...records,...billingRecords])if(r.provider===provider&&r.model===model){r.purpose=value('rulePurpose');r.manualPurpose=true;}await persist();render();},
     async 'save-prices'(){settings.prices=validatePriceTable(JSON.parse(value('prices')));await persist();render();},
     refresh,
@@ -264,7 +310,26 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     },
     async 'append-memory'(){assertIdle();assertFresh();memory=appendMemory(memory,{id:value('eventId'),occurredAt:value('eventDate'),originalTimeText:value('eventRelative'),text:value('eventText')});await persist();render();},
     'export-memory'(){download('cache-lens-memory.json',memory);},
-    async 'save-agent'(){assertIdle();settings.currency=value('currency');const payload={enabled:true,interfaceType:value('agentType'),endpoint:value('agentEndpoint'),model:value('agentModel'),apiKey:value('agentKey'),maxOutputTokens:Number(value('agentOutput')),allowLocal:$(root,'[data-id="agentLocal"]').checked,budget:{maxCalls:settings.maxTests,maxCost:settings.maxCost,currency:settings.currency},prices:{...optionalCachePrices(JSON.parse(value('agentCachePrices')||'{}')),input:Number(value('agentInputPrice')),output:Number(value('agentOutputPrice')),currency:settings.currency,source:value('agentPriceSource'),updatedAt:value('agentPriceDate')}};try{out('agentStatus',await api('agent-config',payload));}finally{set('agentKey','');}await persist();},
+    async 'check-server'(){try{await checkAgentServer();}catch(error){out('agentConnection',error.message);throw error;}},
+    'preset-openai'(){
+      const p=OPENAI_STARTER;
+      if(value('agentEndpoint').trim()!==p.endpoint)set('agentKey','');
+      for(const [id,v]of Object.entries({agentType:p.interfaceType,agentEndpoint:p.endpoint,agentModel:p.model,agentOutput:p.maxOutputTokens,currency:p.currency,agentInputPrice:p.input,agentOutputPrice:p.output,agentPriceSource:p.source,agentPriceDate:p.updatedAt,agentCachePrices:json({cacheRead:p.cacheRead,cacheWrite:p.cacheWrite,cacheWrite30m:p.cacheWrite30m,cacheWrite12h:p.cacheWrite12h}),agentTokenParameter:p.tokenParameter,agentReasoning:p.reasoningEffort}))set(id,v);
+      $(root,'[data-id="agentLocal"]').checked=false;
+      out('agentConnection','已填写 OpenAI 官方接口、gpt-6.1-terra 和价格快照。请填写 OpenAI API 密钥，再检查连接。预算未改变，尚未保存。');
+    },
+    async 'check-agent'(){
+      try{await checkAgentServer();out('agentConnection','正在检查密钥与模型可见性，不生成内容……');const result=await api('agent-check',agentConnectionInput());if(!result.ok||result.modelVisible!==true)throw new Error(agentSetupError(result.code,result.httpStatus));out('agentConnection','连接检查通过：'+(result.authenticationVerified===true?'密钥被接受，':'接口可访问（未确认此兼容接口是否校验密钥），')+'模型 '+result.model+' 可见。尚未进行生成或余额验证；现在可填写预算并保存。');}
+      catch(error){out('agentConnection',error.message);throw error;}
+    },
+    async 'save-agent'(){
+      assertIdle();assertFresh();
+      const maxCalls=Number(value('agentCalls')),maxCost=Number(value('agentCost'));
+      if(!Number.isSafeInteger(maxCalls)||maxCalls<=0||!Number.isFinite(maxCost)||maxCost<=0){out('agentStatus','请填写正数的 Agent 调用次数和总费用上限。只检查连接时无需设置预算。');throw new Error('尚未填写 Agent 预算。');}
+      const payload={...agentConnectionInput(),enabled:true,tokenParameter:value('agentTokenParameter'),reasoningEffort:value('agentType')==='openai'?value('agentReasoning'):'default',maxOutputTokens:Number(value('agentOutput')),budget:{maxCalls,maxCost,currency:value('currency')},prices:{...optionalCachePrices(JSON.parse(value('agentCachePrices')||'{}')),input:Number(value('agentInputPrice')),output:Number(value('agentOutputPrice')),currency:value('currency'),source:value('agentPriceSource'),updatedAt:value('agentPriceDate')}};
+      try{await checkAgentServer();serverStatus=await api('agent-config',payload);set('agentKey','');Object.assign(settings,{currency:payload.budget.currency,maxTests:maxCalls,maxCost});await persist();syncBoundaryInputs();out('agentStatus','配置已保存，密钥已由服务端保管。尚未调用模型。正常观察后，在优化副本中点击“调用 Agent 提案”。');}
+      catch(error){out('agentStatus',error.message);throw error;}
+    },
     async 'save-observer'(){try{await api('observer-config',{id:value('observerId').trim(),relayBaseUrl:value('relayURL'),relayToken:value('relayToken')});await refresh();}finally{set('relayToken','');}},
     async 'load-policy'(){const p=await api('relay-policy?observerId='+encodeURIComponent(value('observerId').trim()));set('policy',json(p.policy||{enabled:false}));out('policyStatus',p);root.dataset.policyVersion=String(p.version);root.dataset.policyObserver=value('observerId').trim();},
     'draft-policy'(){const r=current(),prev=r&&priorFor(r);if(!hasObservedContext(r)||layerOf(r)!=='relay'||!prev)throw new Error('需要同一通道两次实际 relay 请求。');if(r.interfaceType!=='anthropic')throw new Error('仅为已核实 Anthropic Messages 生成断点；兼容名称不代表支持。');const texts=[];for(let i=0;i<(r.body.system||[]).length;i++){const a=r.body.system[i],b=prev.body.system?.[i];if(!a||a.type!=='text'||a.text!==b?.text)break;texts.push(a.text);}if(!texts.length)throw new Error('没有已观察到相同的 system 内容块前缀。');set('policy',json({enabled:true,interfaceType:'anthropic',endpointVerified:true,model:r.model,stableSystemTexts:texts,ttl:'5m',maximumInputTokens:settings.maxInputTokens,rules:PROVIDER_RULES.anthropic}));},
@@ -285,7 +350,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   $(root,'[data-id="record"]').addEventListener('change',event=>{selectedId=event.target.value;render();});
   $(root,'[data-id="purpose"]').addEventListener('change',event=>{const r=current();if(r){r.purpose=event.target.value;r.manualPurpose=true;const bill=billingRecords.find(b=>b.id===r.id);if(bill)bill.purpose=r.purpose;render();}});
   $(root,'[data-id="file"]').addEventListener('change',async event=>{try{const file=event.target.files[0];if(!file)return;if(file.size>16*1024*1024)throw new Error('导入文件超过 16MB');const data=JSON.parse(await file.text());for(const record of importEvidence(data))addRecord(record);set('layer','import');render();}catch(e){status(e.message,true);}finally{event.target.value='';}});
-  for(const [key,id]of [['mode','mode'],['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost'],['currency','currency']])set(id,settings[key]);
+  for(const [key,id]of [['mode','mode'],['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost'],['maxTests','agentCalls'],['maxCost','agentCost'],['currency','currency']])set(id,settings[key]);
   set('prices',json(settings.prices));set('agentPriceDate',new Date().toISOString().slice(0,10));
   $(root,'[data-id="book"]').innerHTML=(context.getWorldInfoNames?.()||[]).map(n=>`<option>${esc(n)}</option>`).join('');
   adapter=adapterFactory({getContext:()=>globalThis.SillyTavern?.getContext?.()||context,onRecord:addRecord,onSources:(s,w)=>{sources=s;world=w;scheduleAutomatic();},onInFlight:n=>{inFlight=n;status(n?`正在观察 ${n} 个请求；修改锁定。`:'被动观察中；不会额外发送正文测试。');if(!n)scheduleAutomatic();},onError:e=>status(e,true),resolvePurpose:body=>committedSettings.rules.find(r=>r.provider===body.chat_completion_source&&r.model===body.model)?.purpose,transform:(body,meta)=>{

@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
-import { AgentService, redactDiagnostic, validateAgentConfig } from '../server/agent.mjs';
+import { AgentService, redactDiagnostic, validateAgentConfig, buildAgentRequest, effectiveTokenParameter } from '../server/agent.mjs';
 import { isPublicAddress, openUpstream, validateEndpoint } from '../server/network.mjs';
 import { init } from '../server/index.mjs';
 
@@ -212,4 +212,146 @@ test('ST routes require authenticated context and explicit reset', async t => {
 test('diagnostics remove secret fields and do not upload world books/raw request arrays', () => {
     const result = redactDiagnostic({ messages: [{ content: 'whole chat' }], books: ['whole book'], api_key: 'secret', nested: { authorization: 'secret', excerpt: 'Bearer abcdef' }, reason: 'cache boundary moved' });
     assert.deepEqual(result, { nested: { excerpt: '[REDACTED]' }, reason: 'cache boundary moved' });
+});
+
+test('unsaved Agent check sends only GET model query, uploads no diagnostic and consumes no budget', async t => {
+    let seen;
+    const { directory, service, config } = await fixture(t, async (req, res) => {
+        let body = ''; for await (const chunk of req) body += chunk;
+        seen = { method: req.method, path: req.url, body, authorization: req.headers.authorization };
+        res.end(JSON.stringify({ id: 'gpt-5.4-mini', object: 'model', ignored: 'upstream-extra-data-must-not-be-returned' }));
+    });
+    const before = await service.status();
+    const result = await service.checkAgent({ interfaceType: 'openai', endpoint: config.endpoint.replace('/v1/', '/gateway/v1/'), model: 'gpt-5.4-mini', apiKey: config.apiKey, allowLocal: true });
+    assert.deepEqual(seen, { method: 'GET', path: '/gateway/v1/models/gpt-5.4-mini', body: '', authorization: `Bearer ${config.apiKey}` });
+    assert.equal(result.ok, true); assert.equal(result.modelVisible, true); assert.equal(result.authenticationVerified, null);
+    assert.equal(result.credentialsAccepted, null); assert.match(result.authenticationEvidence, /may-be-public/);
+    for (const field of ['generationRequested', 'generationVerified', 'billingVerified', 'budgetConsumed', 'saved']) assert.equal(result[field], false);
+    assert.doesNotMatch(JSON.stringify(result), /sk-test|upstream-extra-data/);
+    const after = await service.status();
+    assert.deepEqual(after.ledger, before.ledger); assert.equal(after.configured, false); assert.deepEqual(service.state.records, []);
+    await assert.rejects(fs.access(path.join(directory, '.cache-lens/server-state.json')), { code: 'ENOENT' });
+    assert.equal(after.serverVersion, '0.1.1'); assert.equal(after.capabilities.agentCheck, true);
+    assert.deepEqual(after.capabilities.agentCheckInterfaces, ['openai']);
+});
+
+test('model check key fallback requires exact saved endpoint and does not overwrite saved config', async t => {
+    let seenAuth;
+    const { service, config } = await fixture(t, (req, res) => { seenAuth = req.headers.authorization; res.end(JSON.stringify({ id: 'checked-model' })); });
+    await service.configure(config);
+    const before = structuredClone(service.state);
+    assert.equal((await service.checkAgent({ endpoint: config.endpoint, model: 'checked-model', apiKey: '' })).ok, true);
+    assert.equal(seenAuth, `Bearer ${config.apiKey}`);
+    assert.deepEqual(service.state, before);
+    await assert.rejects(service.checkAgent({ endpoint: config.endpoint.replace('/v1/', '/v2/'), model: 'checked-model', apiKey: '', allowLocal: true }), /KEY_REQUIRED_FOR_ENDPOINT/);
+});
+
+test('check reports unsupported model routes as inconclusive, never as proof of invalid model', async t => {
+    let statusCode = 404;
+    const { service, config } = await fixture(t, (_req, res) => { res.statusCode = statusCode; res.end('sk-upstream-secret and arbitrary instructions'); });
+    const draft = { interfaceType: 'openai', endpoint: config.endpoint, model: 'some-model', apiKey: config.apiKey, allowLocal: true };
+    const missing = await service.checkAgent(draft);
+    assert.equal(missing.ok, false); assert.equal(missing.code, 'MODEL_QUERY_INCONCLUSIVE'); assert.equal(missing.modelVisible, null);
+    statusCode = 401;
+    const denied = await service.checkAgent(draft);
+    assert.equal(denied.code, 'AUTHENTICATION_REJECTED'); assert.equal(denied.connectivityVerified, true); assert.equal(denied.authenticationVerified, false);
+    statusCode = 403;
+    const forbidden = await service.checkAgent(draft);
+    assert.equal(forbidden.code, 'MODEL_QUERY_PERMISSION_DENIED');
+    assert.doesNotMatch(JSON.stringify([missing, denied, forbidden]), /sk-upstream|arbitrary instructions/);
+    assert.equal((await service.status()).ledger.calls, 0);
+});
+
+test('check rejects diagnosis payloads, path traversal and unsupported interfaces before network', async t => {
+    let requests = 0;
+    const { service, config } = await fixture(t, (_req, res) => { requests++; res.end('{}'); });
+    const draft = { endpoint: config.endpoint, model: 'gpt-5.4-mini', apiKey: config.apiKey, allowLocal: true };
+    await assert.rejects(service.checkAgent({ ...draft, diagnostics: { text: 'private story' } }), /INVALID_CHECK_FIELD/);
+    await assert.rejects(service.checkAgent({ ...draft, model: '../secrets' }), /INVALID_CHECK_MODEL/);
+    await assert.rejects(service.checkAgent({ ...draft, model: 'provider/../secrets' }), /INVALID_CHECK_MODEL/);
+    await assert.rejects(service.checkAgent({ ...draft, interfaceType: 'anthropic' }), /OPENAI_ONLY/);
+    await assert.rejects(service.checkAgent({ ...draft, endpoint: 'https://169.254.169.254/v1/chat/completions' }), /PRIVATE_ENDPOINT_FORBIDDEN/);
+    assert.equal(requests, 0);
+});
+
+test('model check response bounds and redirect protection do not trigger generation fallback', async t => {
+    let requests = 0, redirect = false;
+    const { service, config } = await fixture(t, (_req, res) => {
+        requests++;
+        if (redirect) { res.writeHead(302, { location: 'http://169.254.169.254/private' }); res.end(); }
+        else res.end(JSON.stringify({ id: 'model', padding: 'a'.repeat(600 * 1024) }));
+    });
+    const draft = { endpoint: config.endpoint, model: 'model', apiKey: config.apiKey, allowLocal: true };
+    await assert.rejects(service.checkAgent(draft), /RESPONSE_TOO_LARGE/);
+    redirect = true;
+    await assert.rejects(service.checkAgent(draft), /REDIRECT_FORBIDDEN/);
+    assert.equal(requests, 2); assert.equal((await service.status()).ledger.calls, 0);
+});
+
+test('read-only model checks have separate rate limit and preserve paid ledger', async t => {
+    let requests = 0;
+    const { service, config } = await fixture(t, (_req, res) => { requests++; res.end('{"id":"model"}'); });
+    const draft = { endpoint: config.endpoint, model: 'model', apiKey: config.apiKey, allowLocal: true };
+    for (let i = 0; i < 6; i++) assert.equal((await service.checkAgent(draft)).ok, true);
+    await assert.rejects(service.checkAgent(draft), /AGENT_CHECK_RATE_LIMIT/);
+    assert.equal(requests, 6); assert.deepEqual((await service.status()).ledger, { calls: 0, chargedOrReserved: 0, currency: 'USD' });
+});
+
+test('official OpenAI builder uses max_completion_tokens; compatible endpoints default to max_tokens', () => {
+    const config = { interfaceType: 'openai', endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-5.4-mini', maxOutputTokens: 1024 };
+    const official = buildAgentRequest(config, '{"diagnostics":{}}');
+    assert.equal(official.max_completion_tokens, 1024); assert.equal(official.max_tokens, undefined);
+    assert.equal(official.reasoning_effort, undefined); assert.equal(official.temperature, undefined);
+    assert.equal(official.tools, undefined); assert.equal(official.stream, false);
+    for (const endpoint of ['https://api.openai.com.evil.example/v1/chat/completions', 'https://api.openai.com:8443/v1/chat/completions', 'https://gateway.example/openai/v1/chat/completions']) {
+        assert.equal(effectiveTokenParameter({ ...config, endpoint }), 'max_tokens');
+    }
+    assert.equal(buildAgentRequest({ ...config, endpoint: 'https://gateway.example/v1/chat/completions', tokenParameter: 'max_completion_tokens' }, '{}').max_completion_tokens, 1024);
+    assert.equal(buildAgentRequest({ ...config, interfaceType: 'anthropic', endpoint: 'https://api.anthropic.com/v1/messages' }, '{}').max_tokens, 1024);
+});
+
+test('Terra request uses explicit low reasoning with completion budget and no tool execution', () => {
+    const config = { interfaceType: 'openai', endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-6.1-terra', maxOutputTokens: 4096, reasoningEffort: 'low' };
+    const body = buildAgentRequest(config, '{"diagnostics":{}}');
+    assert.equal(body.model, 'gpt-6.1-terra'); assert.equal(body.max_completion_tokens, 4096); assert.equal(body.max_tokens, undefined);
+    assert.equal(body.service_tier, 'default');
+    assert.equal(buildAgentRequest({ ...config, endpoint: 'https://gateway.example/v1/chat/completions' }, '{}').service_tier, undefined);
+    assert.equal(body.reasoning_effort, 'low'); assert.equal(body.tools, undefined); assert.equal(body.tool_choice, undefined);
+    assert.equal(buildAgentRequest({ ...config, reasoningEffort: 'default' }, '{}').reasoning_effort, undefined);
+    assert.equal(buildAgentRequest({ ...config, reasoningEffort: '' }, '{}').reasoning_effort, undefined);
+    assert.equal(buildAgentRequest({ ...config, interfaceType: 'anthropic' }, '{}').reasoning_effort, undefined);
+});
+
+test('reasoning effort configuration is bounded and old blank config retains omitted defaults', async t => {
+    const { config } = await fixture(t, (_req, res) => res.end('{}'));
+    for (const reasoningEffort of ['default', 'none', 'low', 'medium', 'high', 'xhigh', 'max']) assert.equal(validateAgentConfig({ ...config, reasoningEffort }).reasoningEffort, reasoningEffort);
+    const legacy = validateAgentConfig({ ...config, reasoningEffort: '', tokenParameter: '' });
+    assert.equal(legacy.reasoningEffort, 'default'); assert.equal(legacy.tokenParameter, 'auto');
+    assert.throws(() => validateAgentConfig({ ...config, reasoningEffort: 'unbounded' }), /INVALID_REASONING_EFFORT/);
+    assert.throws(() => validateAgentConfig({ ...config, interfaceType: 'anthropic', endpoint: config.endpoint.replace('/chat/completions', '/messages'), reasoningEffort: 'low' }), /ANTHROPIC_REASONING_EFFORT_UNSUPPORTED/);
+});
+
+test('explicit compatible completion token parameter persists and is used in one bounded generation request', async t => {
+    let body, requests = 0;
+    const { service, config } = await fixture(t, async (req, res) => {
+        requests++; let text = ''; for await (const chunk of req) text += chunk; body = JSON.parse(text);
+        res.end('{"choices":[{"message":{"content":"{\\"expectedVersion\\":1,\\"reason\\":\\"none\\",\\"operations\\":[]}"}}]}');
+    });
+    await service.configure({ ...config, tokenParameter: 'max_completion_tokens' });
+    await service.run({ diagnostics: {} });
+    assert.equal(body.max_completion_tokens, config.maxOutputTokens); assert.equal(body.max_tokens, undefined); assert.equal(requests, 1);
+    assert.equal((await service.status()).config.effectiveTokenParameter, 'max_completion_tokens');
+    assert.throws(() => validateAgentConfig({ ...config, tokenParameter: 'unbounded_max' }), /INVALID_TOKEN_PARAMETER/);
+});
+
+test('agent-check route remains authenticated and rejects excessive draft payloads', async t => {
+    const routes = new Map();
+    await init({ get: (route, handler) => routes.set(`GET ${route}`, handler), post: (route, handler) => routes.set(`POST ${route}`, handler) });
+    let status = 200, body;
+    const response = { setHeader() {}, status(code) { status = code; return this; }, json(value) { body = value; } };
+    await routes.get('POST /agent-check')({ body: {} }, response);
+    assert.equal(status, 401); assert.equal(body.error, 'AUTHENTICATED_USER_REQUIRED');
+    const { directory } = await fixture(t, (_req, res) => res.end('{}'));
+    await routes.get('POST /agent-check')({ user: { directories: { root: directory } }, body: { apiKey: 'a'.repeat(9000) } }, response);
+    assert.equal(status, 413); assert.equal(body.error, 'PAYLOAD_TOO_LARGE');
 });

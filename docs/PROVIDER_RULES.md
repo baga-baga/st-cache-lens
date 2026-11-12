@@ -19,7 +19,7 @@
 | --- | --- | --- | --- |
 | Anthropic | `input_tokens` | 普通输入 + `cache_creation_input_tokens` + `cache_read_input_tokens` | 缓存写入细分 5m/1h 时，细分之和不能再次叠加到总创建量。 |
 | 传统 OpenAI Chat/Responses | 总输入 − `cached_tokens` | `prompt_tokens` 或 `input_tokens` | 缓存读取已包含在总输入中。 |
-| 返回独立写入量的 OpenAI Responses | 总输入 − 读取 − 写入 | `input_tokens` | `cache_write_tokens_details` 可含 30m/12h；细分与汇总不可重复计费。 |
+| 返回独立写入量的 OpenAI Chat/Responses | 总输入 − 读取 − 写入 | `prompt_tokens` 或 `input_tokens` | `cache_write_tokens_details` 可含 30m/12h；细分与汇总不可重复计费。 |
 | DeepSeek | `prompt_cache_miss_tokens`，或总输入 − 命中 | `prompt_tokens` | 缓存未命中不是 Anthropic 的溢价缓存创建。 |
 
 统一展示的**缓存读取比例 = 缓存读取 tokens ÷ 总输入 tokens**。零输入、不完整或互相矛盾的 usage 不能产生可信比例。缺失字段显示未知，不把未知当零。
@@ -31,3 +31,11 @@
 整书全部内容量、配置的预算上限、本轮激活条目量、最终发送输入量是四个不同数值。150 万这个孤立数字不能确定实际请求超限，也不能证明实际发送了整本书。诊断页面保留这些数值的来源与计数方法；没有观测的项显示未知。估算不能标为 tokenizer 精确值。
 
 未经用户设置预算，不发起额外的付费优化请求或缓存预热。离线回放不联网；被动观察只跟随用户正常请求。单纯为了让曲线变好而扩充常驻资料或重复调用，不属于本包的优化目标。
+
+## OpenAI Agent 接入快照（0.1.1）
+
+一键配置选 `gpt-6.1-terra`，标准短上下文价格每百万输入 $1、读取 $0.05、输出 $5，缓存创建30分钟 $1.25 /12小时 $2.50；核对日期2026-11-12。Agent诊断体限制24KiB，不上传整本世界书。
+
+官方依据：[Terra模型](https://developers.openai.com/api/docs/models/gpt-6.1-terra)、[Chat Completions参数](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[模型查询](https://developers.openai.com/api/reference/resources/models/methods/retrieve)。官方请求使用 `service_tier: default`、`max_completion_tokens`；一键配置推理low、上限4096（包含推理token）。这只是起步设置，实际效果和费用需正常观察，不能凭型号宣布最优。
+
+连接检查只 GET 查询模型，不发生成请求。官方精确端点依据已核验的鉴权接口返回认证状态；自定义兼容接口可能公开模型信息，因此不会把模型可见等同密钥已校验。

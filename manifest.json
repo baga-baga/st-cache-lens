@@ -1,0 +1,12 @@
+{
+  "display_name": "Cache Lens · 缓存诊断与受约束优化",
+  "loading_order": 200,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Cache Lens contributors",
+  "version": "0.1.0",
+  "minimum_client_version": "1.19.0",
+  "auto_update": false
+}

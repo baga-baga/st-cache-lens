@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "port": 8937,
+  "interfaceType": "anthropic",
+  "upstreamBaseUrl": "https://api.anthropic.com",
+  "apiKeyEnv": "CACHE_LENS_UPSTREAM_KEY",
+  "relayTokenEnv": "CACHE_LENS_RELAY_TOKEN",
+  "allowLocalUpstream": false,
+  "modelPurpose": {
+    "claude-opus-5-5": "main"
+  },
+  "maxInputBytes": 8388608,
+  "maxRecords": 20,
+  "maxStoredBytes": 33554432,
+  "maxResponseBufferBytes": 1048576,
+  "timeoutMs": 180000
+}

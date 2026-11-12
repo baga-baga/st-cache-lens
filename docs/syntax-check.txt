@@ -1,0 +1,5 @@
+
+> sillytavern-cache-lens@0.1.0 check
+> node scripts/check.mjs
+
+{"syntaxFiles":40,"json":"valid"}

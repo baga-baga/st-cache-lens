@@ -1,0 +1,25 @@
+{
+  "name": "sillytavern-cache-lens",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-based request diagnostics and bounded optimization for SillyTavern",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/baga-baga/st-cache-lens.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node scripts/check.mjs",
+    "install:st": "node scripts/install.mjs",
+    "relay": "node server/relay.mjs",
+    "demo": "node scripts/demo.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

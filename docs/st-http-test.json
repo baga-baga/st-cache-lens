@@ -1,0 +1,18 @@
+{
+  "hostVersion": "1.19.0",
+  "hostSource": "official release checkout",
+  "checks": [
+    "extension HTTP module served",
+    "server plugin authenticated route",
+    "CSRF-protected settings route",
+    "official ST Claude conversion -> relay -> mock upstream",
+    "nonstream JSON forwarded",
+    "Anthropic SSE forwarded",
+    "relay usage preserved where ST nonstream omits it",
+    "no credentials in observation records"
+  ],
+  "passed": 8,
+  "paidApiCalls": 0,
+  "providerCacheImprovementVerified": false,
+  "syntheticUpstream": true
+}

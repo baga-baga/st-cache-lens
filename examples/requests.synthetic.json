@@ -1,0 +1,44 @@
+{
+  "synthetic": true,
+  "notice": "离线测试素材。usage 数字是人为构造，不代表真实 Claude 或任何账户的缓存结果。",
+  "records": [
+    {
+      "id": "synthetic-1",
+      "provider": "anthropic",
+      "interfaceType": "anthropic",
+      "model": "fixture-main-model",
+      "purpose": "main",
+      "observationLevel": "synthetic",
+      "body": {
+        "model": "fixture-main-model",
+        "system": [{"type":"text","text":"固定规则：保留人物事实。"},{"type":"text","text":"世界书：人物甲处于阶段一。"}],
+        "messages": [{"role":"user","content":"历史剧情摘要：5天前抵达城门。"},{"role":"user","content":"继续故事。"}]
+      },
+      "usage": {"input_tokens":100,"cache_creation_input_tokens":3000,"cache_read_input_tokens":0,"output_tokens":200}
+    },
+    {
+      "id": "synthetic-2",
+      "provider": "anthropic",
+      "interfaceType": "anthropic",
+      "model": "fixture-main-model",
+      "purpose": "main",
+      "observationLevel": "synthetic",
+      "body": {
+        "model": "fixture-main-model",
+        "system": [{"type":"text","text":"固定规则：保留人物事实。"},{"type":"text","text":"世界书：新增黑王真相与圣婴计划条目。"}],
+        "messages": [{"role":"user","content":"历史剧情摘要：上周二抵达城门，随后开始调查。"},{"role":"user","content":"继续故事。"},{"role":"assistant","content":"调查开始。"},{"role":"user","content":"查看现场。"}]
+      },
+      "usage": {"input_tokens":120,"cache_creation_input_tokens":3300,"cache_read_input_tokens":0,"output_tokens":180}
+    },
+    {
+      "id": "synthetic-summary",
+      "provider": "deepseek",
+      "interfaceType": "deepseek",
+      "model": "fixture-summary-model",
+      "purpose": "summary",
+      "observationLevel": "synthetic",
+      "body": {"model":"fixture-summary-model","messages":[{"role":"user","content":"总结最近新发生的事件。"}]},
+      "usage": {"prompt_tokens":1000,"prompt_cache_hit_tokens":600,"prompt_cache_miss_tokens":400,"prompt_tokens_details":{"cached_tokens":600},"completion_tokens":100}
+    }
+  ]
+}

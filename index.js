@@ -2,6 +2,8 @@ import { OPENAI_STARTER, agentSetupError } from './adapters/agent-setup.js';
 import { applyPolicyTransaction, rollbackPolicyTransaction, recoverPolicyIntent, advanceHistoryAfterRollback, rebasePolicyHistory } from './adapters/relay-control.js';
 import { installSTAdapter } from './adapters/st.js';
 import { createBrowserStateStore } from './adapters/state-store.js';
+import { createObservationStore } from './adapters/observation-store.js';
+import { diagnosticSummary } from './adapters/diagnostic-view.js';
 import { observationLayer, ledgerRecords, pricesFor, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence } from './adapters/reporting.js';
 import { hasObservedContext, normalizeUISources, worldSummary } from './adapters/ui-data.js';
 import { eligibleSources, localCandidate, transformWithProfile } from './adapters/pipeline.js';
@@ -31,11 +33,12 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let memory = settings.memory || createMemoryLedger();
   let adapter, store = null, stateReady = false, savedSnapshot = null, capturedBinding = null, pendingAutoRecord = null, lastAutoRecordId = null;
   let actionQueue = Promise.resolve(), disposed = false;
+  let observationStore = null, archiveEnabled = false, archiveWrites = Promise.resolve();
   let committedSettings = clone({...settings,state:opt,memory});
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.1</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.2</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <div class="cl-grid">
@@ -55,13 +58,14 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     <p class="cl-note">键为 provider:model 或完整 model。字段 input/cacheRead/cacheWrite/cacheWrite5m/cacheWrite1h/output；Responses 另支持 cacheWrite30m/cacheWrite12h。未知价格不按零收费。</p>
     <button data-action="save-prices">保存价格</button>
   </details>
-  <div class="cl-toolbar"><button data-action="refresh">刷新服务端观察</button><button data-action="export">导出脱敏诊断</button><button data-action="import">导入请求 / usage / 账单</button><button data-action="clear">清空内存观察</button></div>
+  <div class="cl-toolbar"><button data-action="refresh">刷新服务端观察</button><button data-action="export">导出脱敏诊断</button><button data-action="import">导入请求 / usage / 账单</button><button data-action="clear">清空观察与本机存档</button></div>
+  <p class="cl-note" data-id="archiveStatus" role="status">正在读取本机脱敏存档。原始提示词只在当前页面内存中保留。</p>
   <input type="file" accept=".json" data-id="file" hidden>
   <div data-id="ledger" class="cl-scroll"></div>
   <p class="cl-note">读取比例＝缓存读取 / 全部输入，仅统计 usage 完整的请求；未知项不按零。费用为配置价格计算值；平台账单另列。前端和 relay 分层显示，避免同一请求重复合计。</p>
   <div class="cl-grid"><label>观察层<select data-id="layer"><option value="frontend">前端</option><option value="relay">服务端 relay</option><option value="import">导入证据</option></select></label><label>选择请求<select data-id="record"></select></label><label>更正此请求用途<select data-id="purpose"><option value="unknown">待归类</option><option value="main">正文</option><option value="summary">摘要</option><option value="agent">优化 Agent</option></select></label></div>
   <div data-id="facts" class="cl-facts"></div>
-  <details open><summary>最早差异、稳定前缀与来源</summary><pre data-id="difference"></pre></details>
+  <details open><summary>最早差异、稳定前缀与来源</summary><div data-id="differenceSummary" class="cl-diagnostic-summary"></div><details><summary>技术详情（本机原文片段）</summary><pre data-id="difference"></pre></details></details>
   <details><summary>当前请求 / usage / 来源（仅本机显示）</summary><pre data-id="request"></pre></details>
   <details><summary>世界书：整书、预算、激活、发送</summary><div class="cl-toolbar"><select data-id="book"></select><button data-action="inspect-book">读取所选世界书</button></div><pre data-id="world"></pre><p class="cl-note">整书读取不等于注入。最终发送量只接受明确证据，无法归因时显示未知；触发、递归、分组、概率和预算保持原状。</p></details>
   <details open><summary>优化副本与完整回滚</summary>
@@ -139,6 +143,17 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     try {
       const namespace=storageNamespace ?? (await import('/scripts/user.js')).getCurrentUserHandle();
       if(typeof namespace!=='string'||!namespace)throw new Error('无法确定当前酒馆账号的存储隔离标识。');
+      try {
+        observationStore=createObservationStore({key:'cache-lens:observations:v1:'+encodeURIComponent(namespace),storage,locks});
+        const restored=await observationStore.read();
+        archiveEnabled=true;
+        const liveIds=new Set(billingRecords.map(r=>r.id));
+        const archived=restored.filter(r=>!liveIds.has(r.id)).map(r=>({...r,archived:true,sources:[],observationNotice:r.observationLevel==='frontend'?'仅观察到前端请求；已恢复脱敏记录，原始提示词未保存，服务端转换与中转内部路由仍不可见。':'已恢复本机脱敏观察记录；原始请求未保存，不能重新比较或优化。'}));
+        billingRecords=[...archived,...billingRecords];
+        records=[...archived.slice(-MAX_RECORDS),...records].slice(-MAX_RECORDS);
+        out('archiveStatus',`已恢复 ${archived.length} 条脱敏记录。自动保留最近最多 1000 条 / 2MiB；不保存提示词原文。清除浏览器数据或更换浏览器后无法恢复。`);
+        render();if(liveIds.size)saveObservations();
+      } catch {archiveEnabled=false;out('archiveStatus','本机存档不可用或格式损坏，原存档未覆盖；当前只能临时观察，请及时导出。可以明确清空观察与本机存档后重新开始。');}
       store=createBrowserStateStore({key:'cache-lens:v1:'+encodeURIComponent(namespace),storage,locks});
       const saved=await store.initialize(committedSettings);
       if(!saved?.state?.profile || !saved?.memory)throw new Error('持久化优化状态格式无效；已禁止自动覆盖。');
@@ -152,7 +167,23 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   function usageFor(r) { return normalizeUsage(r.usage,r.interfaceType || r.provider); }
   function ratesFor(r) { return pricesFor(r, settings.prices); }
   function priorFor(r) { return records.slice(0, records.indexOf(r)).reverse().find(p=>hasObservedContext(p)&&requestGroupKey(p)===requestGroupKey(r)); }
-  function diagnostic(r=current()) { if(!hasObservedContext(r))return {notice:'本请求未观察到可比较的上下文；不能据此判断前缀或缓存失效。'};const prev=r&&priorFor(r);return prev ? analyzePair(prev,r,{sources:r.sources,previousSources:prev.sources}) : {notice:'需要同一模型、用途、接口和观察层的两次请求。'}; }
+  function diagnostic(r=current()) {
+    if(!hasObservedContext(r))return r?.diagnostic&&(r.archived||r.diagnostic.firstDifference||r.diagnostic.equal===true||r.diagnostic.appendOnly===true)?{...r.diagnostic,archived:true}:{notice:'本请求未观察到可比较的上下文；不能据此判断前缀或缓存失效。'};
+    const prev=priorFor(r);
+    if(prev)return {...analyzePair(prev,r,{sources:r.sources,previousSources:prev.sources}),comparison:{previousStartedAt:prev.startedAt??prev.time??null,previousStatus:prev.status??'unknown'}};
+    return r?.diagnostic&&(r.diagnostic.firstDifference||r.diagnostic.equal===true||r.diagnostic.appendOnly===true)?{...r.diagnostic,archived:true}:{notice:'需要当前页面内同一模型、用途、接口和观察层的两次完整请求；历史脱敏存档没有原文，不能作为新的比较基准。'};
+  }
+  function saveObservations(items=billingRecords) {
+    if(!observationStore||!archiveEnabled)return;
+    const snapshot=items.map(r=>{
+      const live=records.find(x=>x.id===r.id);const d=compactDiagnostic(diagnostic(live||r));
+      r.diagnostic=d;if(live)live.diagnostic=d;
+      return {...r,diagnostic:d};
+    });
+    archiveWrites=archiveWrites.then(()=>observationStore.upsert(snapshot)).then(()=>{
+      if(!disposed)out('archiveStatus','脱敏观察已自动保存到本浏览器当前酒馆账号（最多 1000 条 / 2MiB）。刷新后可恢复用量与差异结论；原始提示词不保存。');
+    }).catch(()=>{if(!disposed)out('archiveStatus','本机存档写入失败，当前新记录未确认保存。请先导出诊断；存储配额不足或缺少 Web Locks 时请改用 localhost / HTTPS。不会自动重发模型请求。');});
+  }
   function localContext(r=current()) {
     if(!hasObservedContext(r)) throw new Error('先选择一次具有完整上下文的请求；只有 usage 或采集超限的记录不能用于优化。');
     // Byte-level tokenizer upper bound only for supported text-based protocols. Includes FULL request remainder.
@@ -165,14 +196,15 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     const i=records.findIndex(r=>r.id===next.id);if(i>=0)records[i]=next;else records.push(next);
     while(records.length>MAX_RECORDS || (records.length>1&&JSON.stringify(records).length>MAX_TOTAL_BYTES)) records.shift();
     if(!selectedId || !records.some(r=>r.id===selectedId)) selectedId=next.id;
-    const billed={id:next.id,model:next.model,provider:next.provider,interfaceType:next.interfaceType,purpose:next.purpose,observationLevel:next.observationLevel,imported:next.imported,usage:next.usage,prices:next.prices,platformBill:next.platformBill,latencyMs:next.latencyMs,status:next.status,completion:next.completion,transmission:next.transmission,startedAt:next.startedAt||next.time,synthetic:next.synthetic};
+    const billed={id:next.id,model:next.model,provider:next.provider,interfaceType:next.interfaceType,purpose:next.purpose,manualPurpose:next.manualPurpose,observationLevel:next.observationLevel,imported:next.imported,usage:next.usage,prices:next.prices,platformBill:next.platformBill,latencyMs:next.latencyMs,status:next.status,reportedStatus:next.reportedStatus,completion:next.completion,transmission:next.transmission,startedAt:next.startedAt||next.time,synthetic:next.synthetic,transformed:next.transformed,diagnostic:next.diagnostic};
+    billed.synthetic=!!(next.synthetic||next.replay||next.predicted||next.evidence==='offline-preview');
     const bi=billingRecords.findIndex(r=>r.id===billed.id);if(bi>=0)billingRecords[bi]=billed;else if(billingRecords.length<10000)billingRecords.push(billed);else status('用量记录达到 10000 条上限；请导出并开始新观察会话。当前累计不再完整。',true);
-    render();
+    saveObservations([billed]);render();
     if(next.status==='complete'&&next.purpose==='main'&&next.observationLevel==='frontend'){pendingAutoRecord=next;scheduleAutomatic();}
   }
   function render() {
     const layer=value('layer');const list=records.filter(r=>layerOf(r)===layer);
-    const select=$(root,'[data-id="record"]');select.innerHTML=list.map(r=>`<option value="${esc(r.id)}">${esc((r.startedAt||'').slice(11,19))} · ${esc(purposeLabel[r.purpose]||r.purpose)} · ${esc(r.model)} · ${esc(r.status||'observed')}</option>`).join('');
+    const select=$(root,'[data-id="record"]');select.innerHTML=list.map(r=>`<option value="${esc(r.id)}">${esc((r.startedAt||'').slice(11,19))}${r.startedAt?.endsWith('Z')?' UTC':''} · ${esc(purposeLabel[r.purpose]||r.purpose)} · ${esc(r.model)} · ${esc(r.status||'observed')}${r.archived?' · 存档':''}</option>`).join('');
     if(!list.some(r=>r.id===selectedId)) selectedId=list.at(-1)?.id;
     select.value=selectedId||'';
     const groups=summarizeUsage(ledgerRecords(billingRecords,layer),settings.prices);
@@ -181,10 +213,11 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     if(r) {
       const u=usageFor(r),c=calculateCost(u,ratesFor(r));
       $(root,'[data-id="facts"]').innerHTML=`<div><b>${esc(r.observationNotice||(layerOf(r)==='relay'?(r.transmission==='not-attempted'?'本地已拦截；此请求未发往上游':r.transmission==='attempted'?'relay 已尝试发送；未确认上游响应':'已观察 relay 出站请求和上游响应；中转内部转换不可见'):'导入证据：来源待核实'))}</b></div><div>实际输入：${display(u.totalInput)} tokens · 文本估计：${hasObservedContext(r)?estimateTokens(JSON.stringify(projectContext(r))).value:'未知'}（非精确） · 延迟：${display(r.latencyMs)} ms · 费用：${display(c.amount)} ${esc(c.currency||'')}${r.platformBill?` · 平台账单：${display(r.platformBill.amount)} ${esc(r.platformBill.currency)}`:''}</div>`;
-      out('difference', {...diagnostic(r),duplicates:hasObservedContext(r)?diagnoseDuplicates(r):[]});
+      const d=diagnostic(r);out('differenceSummary',diagnosticSummary(d,r));
+      out('difference', {...d,duplicates:hasObservedContext(r)?diagnoseDuplicates(r):[]});
       out('request',r);
       out('world',worldSummary(r,{maxInputTokens:settings.maxInputTokens}));
-    } else {out('difference','等待正常请求，或导入脱敏 JSON。');out('request','');$(root,'[data-id="facts"]').textContent='仅观察到前端请求（尚无完整服务端记录）';}
+    } else {out('differenceSummary','等待正常请求，或导入已有脱敏诊断。');out('difference','等待正常请求，或导入脱敏 JSON。');out('request','');$(root,'[data-id="facts"]').textContent='仅观察到前端请求（尚无完整服务端记录）';}
     out('history',{version:opt.profile.version,mode:settings.mode,blocks:opt.profile.blocks.length,transactions:opt.history.map(t=>({id:t.id,at:t.at,reason:t.reason,impact:t.impact,rollback:t.rollback}))});
     out('rules',settings.rules);out('memory',renderMemory(memory));
   }
@@ -265,7 +298,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     if(disposed||!stateReady||settings.pendingRelayIntent||settings.mode!=='automatic'||!pendingAutoRecord||pendingAutoRecord.id===lastAutoRecordId||inFlight||busy||adapter?.getSnapshot?.().generation)return;
     const record=pendingAutoRecord;
     actionQueue=actionQueue.then(async()=>{
-      if(disposed||settings.mode!=='automatic'||inFlight||busy||adapter?.getSnapshot?.().generation)return;
+      if(disposed||settings.mode!=='automatic'||inFlight||busy||adapter?.getSnapshot?.().generation||!records.some(r=>r.id===record.id)||pendingAutoRecord?.id!==record.id)return;
       if(record.id===lastAutoRecordId||!matchesBinding(record))return;
       lastAutoRecordId=record.id;
       const proposal=localCandidate(opt.profile);if(!proposal.operations.length)return;
@@ -275,12 +308,18 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   }
   const actions = {
     async save(){assertIdle();assertFresh();const proposed={};for(const [key,id]of [['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost']]){const n=Number(value(id));if(!Number.isFinite(n)||n<0||(key!=='maxCost'&&!Number.isSafeInteger(n)))throw new Error('tokens 和次数上限必须是非负整数，费用须是非负数字');proposed[key]=n;}if(proposed.maxInputTokens<1||proposed.contextTokens<=proposed.outputReserveTokens)throw new Error('输入和上下文边界无效');if(!['diagnose','preview','automatic'].includes(value('mode')))throw new Error('未知运行模式');Object.assign(settings,proposed,{mode:value('mode')});await persist();syncBoundaryInputs();status('已保存边界；自动模式在下一次正常正文完成后，只在已授权副本范围内生成免费本地排序方案。');render();scheduleAutomatic();},
-    async 'add-rule'(){const provider=value('ruleProvider').trim(),model=value('ruleModel').trim();if(!provider||!model)throw new Error('需要接口来源和完整模型 ID');settings.rules=settings.rules.filter(r=>!(r.provider===provider&&r.model===model));settings.rules.push({provider,model,purpose:value('rulePurpose')});for(const r of [...records,...billingRecords])if(r.provider===provider&&r.model===model){r.purpose=value('rulePurpose');r.manualPurpose=true;}await persist();render();},
+    async 'add-rule'(){const provider=value('ruleProvider').trim(),model=value('ruleModel').trim();if(!provider||!model)throw new Error('需要接口来源和完整模型 ID');settings.rules=settings.rules.filter(r=>!(r.provider===provider&&r.model===model));settings.rules.push({provider,model,purpose:value('rulePurpose')});for(const r of [...records,...billingRecords])if(r.provider===provider&&r.model===model){r.purpose=value('rulePurpose');r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;}await persist();saveObservations();render();},
     async 'save-prices'(){settings.prices=validatePriceTable(JSON.parse(value('prices')));await persist();render();},
     refresh,
     export(){download('cache-lens-diagnostics-redacted.json',redactedExport({records:billingRecords,prices:settings.prices,history:opt.history,diagnosticFor:r=>diagnostic(records.find(x=>x.id===r.id)||r)}));},
     import(){ $(root,'[data-id="file"]').click(); },
-    clear(){assertIdle();records=[];billingRecords=[];selectedId=null;render();},
+    async clear(){
+      assertIdle();const removedIds=new Set(billingRecords.map(r=>r.id));
+      if(observationStore){const cleared=archiveWrites.then(()=>observationStore.clear());archiveWrites=cleared.catch(()=>{});await cleared;archiveEnabled=true;}
+      records=records.filter(r=>!removedIds.has(r.id));billingRecords=billingRecords.filter(r=>!removedIds.has(r.id));if(removedIds.has(selectedId))selectedId=null;render();
+      if(removedIds.has(pendingAutoRecord?.id))pendingAutoRecord=null;lastAutoRecordId=null;
+      out('archiveStatus','观察与本机脱敏存档已清空；优化副本、回滚记录和 Agent 预算未重置。');if(billingRecords.length)saveObservations();
+    },
     async 'inspect-book'(){const book=await adapter.inspectWorldBook(value('book'));out('world',worldSummary(current(),{book,maxInputTokens:settings.maxInputTokens}));},
     capture(){assertIdle();const r=current();if(!hasObservedContext(r)||layerOf(r)!=='frontend'||r.purpose!=='main')throw new Error('先选择一次具有完整上下文并已归类为正文的前端请求；采集超限或只有 usage 时不能提取片段');capturedBinding={chatId:r.chatId??'',model:r.model,provider:r.provider,purpose:r.purpose};captured=eligibleSources(r.body,r.sources||sources);$(root,'[data-id="fragments"]').innerHTML=captured.length?captured.map((b,i)=>`<div class="cl-fragment"><label><input type="checkbox" data-fragment="${i}">独立可重排</label><label><input type="checkbox" data-stable="${i}">稳定</label><b>${esc(b.source.name||b.id)}</b><small>${esc(b.scope)} · ${b.content.length} 字符</small><code>${esc(b.content.slice(0,100))}</code></div>`).join(''):'未找到可精确定位且标签闭合的片段。宏展开、跨消息或未知插件不会被强行适配。';},
     async copy(){assertIdle();assertFresh();if(opt.undoStack?.length)throw new Error('当前仍有生效修改；先恢复优化前再建立新副本。');const blocks=captured.filter((b,i)=>$(root,`[data-fragment="${i}"]`)?.checked).map(b=>{const i=captured.indexOf(b);return {...b,approvedIndependent:true,stable:$(root,`[data-stable="${i}"]`).checked};});if(blocks.length<2||!capturedBinding)throw new Error('至少选择两个已确认独立的片段。');settings.archivedOptimizationHistory=[...(settings.archivedOptimizationHistory||[]),...opt.history.map(t=>({id:t.id,at:t.at,reason:t.reason,rollback:t.rollback}))].slice(-100);opt=createOptimizationState(createProfile({id:'live-copy',mode:'preview',blocks,binding:capturedBinding,limits:limits()}));lastAutoRecordId=null;preview=null;lastPreviewState=null;await persist();render();status('已建立当前聊天、模型和用途专属副本；原始配置未被覆盖。');},
@@ -348,7 +387,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   root.addEventListener('click',event=>{const action=event.target.closest('[data-action]')?.dataset.action;if(!action)return;actionQueue=actionQueue.then(async()=>{await ready;await actions[action]?.();}).catch(error=>status(error.message,true));});
   $(root,'[data-id="layer"]').addEventListener('change',()=>{selectedId=null;render();});
   $(root,'[data-id="record"]').addEventListener('change',event=>{selectedId=event.target.value;render();});
-  $(root,'[data-id="purpose"]').addEventListener('change',event=>{const r=current();if(r){r.purpose=event.target.value;r.manualPurpose=true;const bill=billingRecords.find(b=>b.id===r.id);if(bill)bill.purpose=r.purpose;render();}});
+  $(root,'[data-id="purpose"]').addEventListener('change',event=>{const r=current();if(r){r.purpose=event.target.value;r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;const bill=billingRecords.find(b=>b.id===r.id);if(bill){bill.purpose=r.purpose;bill.manualPurpose=true;}saveObservations();render();}});
   $(root,'[data-id="file"]').addEventListener('change',async event=>{try{const file=event.target.files[0];if(!file)return;if(file.size>16*1024*1024)throw new Error('导入文件超过 16MB');const data=JSON.parse(await file.text());for(const record of importEvidence(data))addRecord(record);set('layer','import');render();}catch(e){status(e.message,true);}finally{event.target.value='';}});
   for(const [key,id]of [['mode','mode'],['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost'],['maxTests','agentCalls'],['maxCost','agentCost'],['currency','currency']])set(id,settings[key]);
   set('prices',json(settings.prices));set('agentPriceDate',new Date().toISOString().slice(0,10));
@@ -365,7 +404,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   render();status('被动观察已开启，正在载入持久化优化状态。');
   const ready=initializeStore();
   // Read-only publicly documented adapter surface, never accepts executable Agent tools.
-  const publicAPI={ready,getMemory:()=>clone(memory),getDiagnostics:()=>compactDiagnostic(diagnostic()),getRecords:()=>clone(records),adapter,dispose(){disposed=true;clearInterval(timer);adapter.dispose();root.remove();}};
+  const publicAPI={ready,flushObservations:()=>archiveWrites,getMemory:()=>clone(memory),getDiagnostics:()=>compactDiagnostic(diagnostic()),getRecords:()=>clone(records),adapter,dispose(){disposed=true;clearInterval(timer);adapter.dispose();root.remove();}};
   return publicAPI;
 }
 

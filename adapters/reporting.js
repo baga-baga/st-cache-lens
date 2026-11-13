@@ -54,9 +54,19 @@ export function trialInput({records=[],baselineIds=[],layer='frontend',settings=
     completed:baselineIds.every(id=>records.some(r=>r.id===id))&&![...baseline,...candidate].some(r=>['pending','reserved'].includes(r.status)||r.completion==='pending')};
 }
 export function compactDiagnostic(d={}) {
+  d=d&&typeof d==='object'?d:{};
+  const codes=new Set(['SUMMARY_REWRITE','SUMMARY_POSITION_MOVED','SUMMARY_TEXT_CHANGED','RELATIVE_TIME_TEXT_CHANGED','CONTEXT_PREFIX_CHANGED','STABLE_EXPLICIT_BREAKPOINT','REQUEST_CONFIGURATION_CHANGED','INCOMPARABLE_REQUEST_GROUP','EXACT_DUPLICATE_BLOCK','EXACT_DUPLICATE_SOURCE','ACTIVATED_INPUT_OVER_LIMIT','ACTIVATED_OVER_BUDGET','LARGE_BOOK_TOTAL','SENT_INPUT_OVER_LIMIT']);
+  const path=d.firstDifference?.currentPath??d.firstDifference?.previousPath??d.firstDifference?.path;
+  const safePath=typeof path==='string'&&/^(?:messages|system|tools|input|instructions|prompt)(?:\[\d+\]|\.[a-zA-Z_][a-zA-Z_0-9]*)*$/.test(path)&&path.length<180?path:null;
+  const kinds=new Set(['content','structure','append','removal']);
+  const statuses=new Set(['pending','reserved','complete','completed','http-error','request-error','observation-error','network-error','stream-error','aborted','error','failed','cancelled','observed','imported']);
   return {stablePrefixCharacters:safeNumber(d.stablePrefixCharacters)?d.stablePrefixCharacters:null,appendOnly:d.appendOnly===true,
-    firstDifference:d.firstDifference?{path:d.firstDifference.currentPath??d.firstDifference.previousPath??null,kind:d.firstDifference.kind}:null,
-    findings:(d.findings||[]).map(f=>({code:f.code,severity:f.severity})),needsAnotherRequest:!!d.notice,observation:'local-diagnostic-not-cache-hit-proof'};
+    ...(typeof d.equal==='boolean'?{equal:d.equal}:{}),...(typeof d.comparable==='boolean'?{comparable:d.comparable}:{}),
+    firstDifference:d.firstDifference?{path:safePath,kind:kinds.has(d.firstDifference.kind)?d.firstDifference.kind:'unknown',
+      ...(Number.isSafeInteger(d.firstDifference.offset)&&d.firstDifference.offset>=0?{offset:d.firstDifference.offset}:{})}:null,
+    ...(d.comparison?{comparison:{previousStartedAt:timestamp(d.comparison.previousStartedAt),previousStatus:statuses.has(d.comparison.previousStatus)||(Number.isInteger(d.comparison.previousStatus)&&d.comparison.previousStatus>=100&&d.comparison.previousStatus<=599)?d.comparison.previousStatus:'unknown'}}:{}),
+    findings:(Array.isArray(d.findings)?d.findings:[]).filter(f=>codes.has(f?.code)).slice(0,100).map(f=>({code:f.code,severity:['notice','warning','info'].includes(f.severity)?f.severity:'notice'})),
+    needsAnotherRequest:d.needsAnotherRequest===true||!!d.notice,observation:'local-diagnostic-not-cache-hit-proof'};
 }
 export function agentPayload(profile,diagnostic) {
   return {diagnostics:compactDiagnostic(diagnostic),proposalContext:{expectedVersion:profile.version,limits:clone(profile.limits),
@@ -112,7 +122,7 @@ export function importEvidence(data,{idPrefix=`import:${Date.now()}`}={}) {
   const items=Array.isArray(data)?data:Array.isArray(data?.records)?data.records:[data];
   if(items.length>200)throw new Error('一次最多导入 200 条记录。');
   return items.flatMap((item,i)=>{
-    if(!item||typeof item!=='object'||Array.isArray(item)||(!item.body&&!item.request&&!item.usage&&!item.platformBill))return [];
+    if(!item||typeof item!=='object'||Array.isArray(item)||(!item.body&&!item.request&&!item.usage&&!item.platformBill&&!(data?.redacted===true&&item.diagnostic)))return [];
     const original=item.body??item.request??{};
     if(!original||typeof original!=='object'||Array.isArray(original))throw new Error('请求 body 必须是 JSON 对象。');
     const body=projectContext(original);
@@ -122,6 +132,7 @@ export function importEvidence(data,{idPrefix=`import:${Date.now()}`}={}) {
       purpose:purposes.has(item.purpose)?item.purpose:'unknown',observationLevel:'imported',imported:true,status:'imported',sources:[],usage:numericUsage(item.usage),platformBill:safeBill(item.platformBill),
       startedAt:timestamp(item.startedAt??item.time),latencyMs:safeNumber(item.latencyMs)?item.latencyMs:null,
       redactedOnImport:state.redacted,observationNotice:state.redacted?'用户导入且已移除疑似凭据；内容已改变，不可用于证明原始前缀。':'用户导入证据；来源待核实，不能据此宣布实际节省。'};
+    if(data?.redacted===true&&item.diagnostic){record.diagnostic=compactDiagnostic(item.diagnostic);record.archived=true;record.reportedStatus=label(item.status);record.observationNotice='导入的脱敏诊断；保留原记录的用量和差异结论，未包含提示词原文，不能重新比较或优化。';}
     if(item.prices){try{record.prices=validatePriceTable({imported:item.prices}).imported;}catch{/* Malformed price evidence stays unpriced. */}}
     return [record];
   });

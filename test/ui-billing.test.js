@@ -85,3 +85,19 @@ test('numeric usage strips arbitrary nested metadata and never fabricates absent
  assert.deepEqual(numericUsage({input_tokens:3,input_tokens_details:{cached_tokens:2,secret:'no'},headers:{secret:2}}),{input_tokens:3,input_tokens_details:{cached_tokens:2}});
  assert.equal(numericUsage({api_key:'no'}),null);assert.equal(compactDiagnostic({}).stablePrefixCharacters,null);
 });
+
+test('compact diagnostics survive repeated redaction with offsets and failed comparison provenance',()=>{
+ const diagnostic={equal:false,comparable:true,stablePrefixCharacters:66839,firstDifference:{currentPath:'messages[21].content',kind:'structure',offset:0,currentExcerpt:{escaped:'PRIVATE'}},comparison:{previousStartedAt:'2026-11-12T16:37:21.395Z',previousStatus:'http-error',apiKey:'PRIVATE'},findings:[{code:'SUMMARY_REWRITE',severity:'notice',source:'PRIVATE'},{code:'PRIVATE',severity:'notice'}]};
+ const compact=compactDiagnostic(diagnostic);assert.deepEqual(compactDiagnostic(compact),compact);
+ assert.equal(compact.firstDifference.offset,0);assert.equal(compact.comparison.previousStatus,'http-error');
+ assert.equal(JSON.stringify(compact).includes('PRIVATE'),false);
+ const malicious=compactDiagnostic({firstDifference:{path:'secret body',kind:'PRIVATE'},findings:[{code:'SECRET_CONTENT'}]});
+ assert.equal(malicious.firstDifference.path,null);assert.deepEqual(malicious.findings,[]);
+});
+
+test('redacted usage-less Claude diagnostic imports without silently discarding it or claiming server evidence',()=>{
+ const data={redacted:true,records:[{model:'story',provider:'custom',interfaceType:'openai',purpose:'main',status:'http-error',observationLevel:'frontend',usage:null,diagnostic:{stablePrefixCharacters:33342,firstDifference:{path:'messages[6].content',kind:'content',offset:31706},findings:[]}}]};
+ const [record]=importEvidence(data);assert.ok(record);assert.equal(record.usage,null);assert.equal(record.observationLevel,'imported');assert.equal(record.reportedStatus,'http-error');assert.equal(record.diagnostic.firstDifference.path,'messages[6].content');assert.equal(record.diagnostic.firstDifference.offset,31706);
+ assert.equal(record.archived,true);assert.deepEqual(record.body,{});assert.match(record.observationNotice,/不能重新比较或优化/);
+ const exported=redactedExport({records:[record],diagnosticFor:r=>r.diagnostic});assert.equal(exported.records[0].diagnostic.stablePrefixCharacters,33342);
+});

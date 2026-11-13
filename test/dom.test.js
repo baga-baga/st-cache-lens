@@ -33,6 +33,12 @@ test('actual panel DOM: observed requests -> bounded preview -> live copy -> rol
   for(let i=0;i<35;i++)hooks.onRecord({...record,id:'retention-'+i});
   assert.equal(panel.getRecords().length,30);
   assert.equal(q('[data-id="ledger"] tbody tr td:nth-child(2)').textContent,'37');
+  // Clearing observations must also discard an old pending automatic trigger.
+  set('mode','diagnose');await click('save');
+  const versionBeforeClear=JSON.parse(q('[data-id="history"]').textContent).version;
+  await click('clear');set('mode','automatic');await click('save');
+  assert.equal(JSON.parse(q('[data-id="history"]').textContent).version,versionBeforeClear);
+  set('mode','preview');await click('save');
   // Exercise actual UI -> durable intent -> versioned remote mock -> full multi-observer restore.
   const originalFetch=globalThis.fetch;
   const policies={main:{policy:{enabled:false},version:'v0',inFlight:0},summary:{policy:{enabled:false},version:'s0',inFlight:0}};let revision=0;

@@ -31,7 +31,11 @@ async function harness({ current = fixture(), collector } = {}) {
     const panel = mountCacheLens({ context, storageNamespace: `batch-dom-${++harnessSerial}`, locks, setupCollector: async args => { collectionCount++; return collector ? collector({ args, count: collectionCount, setup: structuredClone(setup), context }) : structuredClone(setup); }, adapterFactory: value => { hooks = value; return { dispose() { adapterDisposed = true; }, getSnapshot: () => snapshot, getSources: () => [], inspectWorldBook: async () => ({}) }; } });
     await panel.ready;
     const root = document.getElementById('cache-lens-panel'), q = selector => root.querySelector(selector);
-    const click = async name => { q(`[data-action="${name}"]`).click(); await pause(25); };
+    const click = async name => {
+        const button = q(`[data-action="${name}"]`);
+        button.click();
+        await waitFor(() => button.getAttribute('aria-busy') !== 'true', `${name} action completion`, 400);
+    };
     const set = (id, value) => { q(`[data-id="${id}"]`).value = value; };
     const toggleFollow = async enabled => { const element = q('[data-id="batchFollow"]'); element.checked = enabled; element.dispatchEvent(new dom.window.Event('change')); await pause(25); };
     return { dom, context, root, q, set, click, toggleFollow, panel, hooks, fetches, get collectionCount() { return collectionCount; }, get adapterDisposed() { return adapterDisposed; },

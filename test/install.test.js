@@ -34,6 +34,26 @@ test('second install makes recoverable backup', async t => {
   assert.equal(await fs.readFile(path.join(result.components[0].destination, 'index.js'), 'utf8'), 'new version');
 });
 
+test('server-only update preserves per-user Agent key, ledger and frontend Git installation', async t => {
+  const f = await fixture(t);
+  await install({ ...f, frontend: true, server: true });
+  const userRoot = path.join(f.st, 'data/default-user');
+  const stateDirectory = path.join(userRoot, '.cache-lens');
+  const gitDirectory = path.join(userRoot, 'extensions/st-cache-lens/.git');
+  await fs.mkdir(stateDirectory); await fs.mkdir(gitDirectory);
+  const state = JSON.stringify({ config: { apiKey: 'synthetic-key-only' }, ledger: { calls: 2, chargedOrReserved: 0.12 } });
+  await fs.writeFile(path.join(stateDirectory, 'server-state.json'), state, { mode: 0o600 });
+  await fs.writeFile(path.join(gitDirectory, 'config'), 'synthetic-remote');
+  await fs.writeFile(path.join(f.sourceRoot, 'server/index.mjs'), '// new transport\n');
+  const result = await install({ ...f, frontend: false, server: true });
+  assert.equal(result.components.length, 1);
+  assert.equal(result.components[0].kind, 'server');
+  assert.ok(result.components[0].backup);
+  assert.equal(await fs.readFile(path.join(result.components[0].destination, 'server/index.mjs'), 'utf8'), '// new transport\n');
+  assert.equal(await fs.readFile(path.join(stateDirectory, 'server-state.json'), 'utf8'), state);
+  assert.equal(await fs.readFile(path.join(gitDirectory, 'config'), 'utf8'), 'synthetic-remote');
+});
+
 test('reject traversal, unknown destination, old version and bad args', async t => {
   const f = await fixture(t);
   await assert.rejects(install({ ...f, user: '../someone' }), /用户目录名/);

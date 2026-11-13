@@ -28,6 +28,7 @@
 | Windows / macOS / Linux | Node 安装脚本使用跨平台路径；不依赖 Bash | 用户电脑、杀毒软件、实际目录权限 |
 | SillyTavern 1.19.0 | 官方源码接口核验；本地适配与回放测试 | 用户安装及所有现有扩展组合 |
 | Anthropic Messages | 观察最终 `system/messages`、合法 `cache_control` 结构及 usage | 用户中转是否保留字段、是否转路由、缓存隔离/TTL、实际账单 |
+| OpenAI 官方 + Clash HTTP / Mixed | 0.1.8 服务端显式支持回环 HTTP CONNECT；目标仅限 `https://api.openai.com`，保留目标 TLS 验证；Fake-IP 与全局 DNS 无需修改 | 用户实际 Clash 端口、Android / Termux 联通性、真实 OpenAI 账号与付费生成 |
 | OpenAI 兼容接口 | 区分兼容协议与厂商语义；归一化已知 usage 字段；默认不注入 Anthropic 字段 | 中转非标准计费、字段别名、GPT 新旧缓存选项支持 |
 | DeepSeek 摘要 | 独立用途/模型统计，支持官方缓存 hit/miss 字段 | 摘要插件实际走哪条调用路径；第三方独立请求需要适配器或请求导入 |
 | 酒馆助手、类脑缓存插件、用户自动摘要插件 | 已公开来源快照/显式适配器；未确认实现时只读 | 准确仓库、版本、设置导出；没有宣称已支持它们的内部写入 |
@@ -53,3 +54,13 @@
 服务端插件需要在酒馆**根目录**的 `config.yaml` 中启用 `enableServerPlugins: true`。不要编辑 `default/config.yaml`。这是酒馆正式的服务器插件开关，并非本包自动修改。
 
 手动恢复插件程序时，先停止酒馆，把当前 Cache Lens 目录移走，再将安装日志中的备份目录移回对应位置。程序安装备份与界面里的“优化方案回滚”是两种独立机制。
+
+## 0.1.8 本机代理边界
+
+服务端 `agentProxy: true` 表示支持新的显式 Agent 代理配置。只更新前端不能使旧服务端获得联网能力；要使用此功能，先更新扩展、停止酒馆，再在酒馆根目录运行 `node data/default-user/extensions/st-cache-lens/scripts/install.mjs --st . --server`，最后重启。已有 `enableServerPlugins: true` 无需重复修改。0.1.1 服务端可继续提供原有不使用此代理的功能。
+
+代理入口仅允许带明确端口的 HTTP 回环地址 `127.0.0.1` 或 `::1`；`localhost` 固定转换为 `127.0.0.1`，不通过 DNS 发现代理。禁止认证信息、查询、片段或额外路径。代理目标固定在官方 OpenAI HTTPS origin，CONNECT 中传递目标主机名；密钥与请求正文只在随后通过严格证书和主机名校验的 TLS 连接中发送。代理失败不直接回退到公网请求，重定向也不跟随。
+
+该路径只覆盖优化 Agent 的模型查询和预算受控生成。它不改变正文、摘要、relay 或其他扩展的网络路径，不读取/修改 Clash 配置，不宣称能控制 Clash 最终路由或防止设备上其他软件的网络泄露。原直接连接的 DNS 地址检查保留。HTTP 和 Mixed 端口说明依据 [Mihomo 官方文档](https://wiki.metacubex.one/config/inbound/port/)；不支持 SOCKS-only、控制器端口或需要代理认证的入口。
+
+验证范围为本地模拟 HTTP CONNECT 与 TLS 服务，以及配置、预算、错误和前端流程测试；用户手机与真实 Clash/OpenAI 连接尚待接入验证。测试中没有真实付费调用，也不能据此判断 Claude 缓存或连续会话费用已改善。

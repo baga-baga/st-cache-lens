@@ -47,13 +47,14 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let auditController=null,auditResult=null,auditSelection=null;
   const pendingActions=new Set();
   let pendingAuditIntent=null;
+  let agentProxyEdited=false;
   const deadlines={read:15000,agent:120000,setup:30000,ready:10000,...operationTimeouts};
   const batchListeners=[];
   let committedSettings = clone({...settings,state:opt,memory});
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.7</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.8</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
@@ -124,6 +125,9 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       <label class="cl-wide">模型<input data-id="agentModel" placeholder="例如 gpt-6.1-terra" spellcheck="false"></label>
       <label class="cl-wide">API 密钥<input data-id="agentKey" type="password" autocomplete="off" placeholder="只在这里填写；留空保留同地址已保存密钥"></label>
     </div>
+    <label><input data-id="agentProxyEnabled" type="checkbox">通过本机 Clash 代理连接 OpenAI（保留 Fake-IP）</label>
+    <label>Clash HTTP / Mixed 代理地址<input data-id="agentProxyURL" type="url" placeholder="http://127.0.0.1:实际端口" spellcheck="false"></label>
+    <p class="cl-note">填写 Clash 中实际的 HTTP 或 Mixed（混合）端口，不是 SOCKS 单独端口或控制面板端口。API 地址仍填 OpenAI 原地址。此选项仅作用于优化 Agent 的 OpenAI 官方请求，Fake-IP 和酒馆正文连接保持原设置。</p>
     <p class="cl-note">密钥只发送给同源酒馆服务端，不写进前端设置或导出。检查连接只读取模型信息，不发送剧情、不生成内容；不能据此保证余额充足或生成成功。</p>
     <button data-action="check-agent">3. 检查连接与模型（不生成）</button>
     <div class="cl-grid">
@@ -401,11 +405,19 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
         set('agentCachePrices',json(Object.fromEntries(Object.entries(p).filter(([key])=>key.startsWith('cache')))));
         $(root,'[data-id="agentLocal"]').checked=c.allowLocal===true;
       }
+      if(!agentProxyEdited&&value('agentEndpoint').trim()===c.endpoint){set('agentProxyURL',c.proxyUrl||'');$(root,'[data-id="agentProxyEnabled"]').checked=Boolean(c.proxyUrl);}
       out('agentStatus','服务端已有配置：'+c.model+'；密钥已保存在服务端。');
     }
     return serverStatus;
   }
-  function agentConnectionInput() { return {interfaceType:value('agentType'),endpoint:value('agentEndpoint').trim(),model:value('agentModel').trim(),apiKey:value('agentKey'),allowLocal:$(root,'[data-id="agentLocal"]').checked}; }
+  function agentConnectionInput() {
+    const input={interfaceType:value('agentType'),endpoint:value('agentEndpoint').trim(),model:value('agentModel').trim(),apiKey:value('agentKey'),allowLocal:$(root,'[data-id="agentLocal"]').checked};
+    const enabled=$(root,'[data-id="agentProxyEnabled"]').checked;
+    if(enabled&&!serverStatus?.capabilities?.agentProxy)throw new Error(agentSetupError('AGENT_PROXY_SERVER_UPDATE_REQUIRED'));
+    if(enabled&&!value('agentProxyURL').trim())throw new Error(agentSetupError('PROXY_URL_INVALID'));
+    if(serverStatus?.capabilities?.agentProxy)input.proxyUrl=enabled?value('agentProxyURL').trim():'';
+    return input;
+  }
 
   async function refresh() {
     serverStatus=await api('status');out('agentStatus',serverStatus.configured?'已保存 Agent 配置：'+serverStatus.config.model+'。调用仍受预算限制。':'服务端可用，尚未保存 Agent 配置。');
@@ -551,8 +563,9 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       assertIdle();assertFresh();
       const maxCalls=Number(value('agentCalls')),maxCost=Number(value('agentCost'));
       if(!Number.isSafeInteger(maxCalls)||maxCalls<=0||!Number.isFinite(maxCost)||maxCost<=0){out('agentStatus','请填写正数的 Agent 调用次数和总费用上限。只检查连接时无需设置预算。');throw new Error('尚未填写 Agent 预算。');}
-      const payload={...agentConnectionInput(),enabled:true,tokenParameter:value('agentTokenParameter'),reasoningEffort:value('agentType')==='openai'?value('agentReasoning'):'default',maxOutputTokens:Number(value('agentOutput')),budget:{maxCalls,maxCost,currency:value('currency')},prices:{...optionalCachePrices(JSON.parse(value('agentCachePrices')||'{}')),input:Number(value('agentInputPrice')),output:Number(value('agentOutputPrice')),currency:value('currency'),source:value('agentPriceSource'),updatedAt:value('agentPriceDate')}};
-      try{await checkAgentServer();serverStatus=await api('agent-config',payload);set('agentKey','');Object.assign(settings,{currency:payload.budget.currency,maxTests:maxCalls,maxCost});await persist();syncBoundaryInputs();out('agentStatus','配置已保存，密钥已由服务端保管。尚未调用模型。正常观察后，在优化副本中点击“调用 Agent 提案”。');}
+      try{await checkAgentServer();
+        const payload={...agentConnectionInput(),enabled:true,tokenParameter:value('agentTokenParameter'),reasoningEffort:value('agentType')==='openai'?value('agentReasoning'):'default',maxOutputTokens:Number(value('agentOutput')),budget:{maxCalls,maxCost,currency:value('currency')},prices:{...optionalCachePrices(JSON.parse(value('agentCachePrices')||'{}')),input:Number(value('agentInputPrice')),output:Number(value('agentOutputPrice')),currency:value('currency'),source:value('agentPriceSource'),updatedAt:value('agentPriceDate')}};
+        serverStatus=await api('agent-config',payload);set('agentKey','');Object.assign(settings,{currency:payload.budget.currency,maxTests:maxCalls,maxCost});await persist();syncBoundaryInputs();out('agentStatus','配置已保存，密钥已由服务端保管。尚未调用模型。正常观察后，在优化副本中点击“调用 Agent 提案”。');}
       catch(error){out('agentStatus',error.message);throw error;}
     },
     async 'save-observer'(){try{await api('observer-config',{id:value('observerId').trim(),relayBaseUrl:value('relayURL'),relayToken:value('relayToken')});await refresh();}finally{set('relayToken','');}},
@@ -602,6 +615,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     });
   });
   $(root,'[data-id="layer"]').addEventListener('change',()=>{selectedId=null;render();});
+  for(const id of ['agentProxyEnabled','agentProxyURL'])for(const event of ['input','change'])$(root,`[data-id="${id}"]`).addEventListener(event,()=>{agentProxyEdited=true;});
   $(root,'[data-id="record"]').addEventListener('change',event=>{selectedId=event.target.value;render();});
   $(root,'[data-id="purpose"]').addEventListener('change',event=>{const r=current();if(r){r.purpose=event.target.value;r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;const bill=billingRecords.find(b=>b.id===r.id);if(bill){bill.purpose=r.purpose;bill.manualPurpose=true;}saveObservations();render();}});
   $(root,'[data-id="batchFollow"]').addEventListener('change',event=>{const enabled=event.target.checked;actionQueue=actionQueue.then(async()=>{await ready;assertIdle();settings.batchFollow=enabled;await persist();if(enabled)queueBatchScan();else{clearTimeout(batchTimer);batchDirty=false;}renderBatch();}).catch(error=>status(error.message,true));});

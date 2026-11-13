@@ -25,6 +25,17 @@ export function agentSetupError(code, status) {
     AGENT_CHECK_RATE_LIMIT: '连接检查过于频繁，请一分钟后再试。',
     AGENT_CHECK_TIMEOUT: '连接检查超时，请检查酒馆服务器能否访问接口地址。',
     INVALID_ENDPOINT: '接口地址格式无效，请填写包含 https:// 的完整地址。',
+    PRIVATE_ENDPOINT_FORBIDDEN: '接口地址或其 DNS 结果落在受保护的非公网范围；Clash Fake-IP 可能触发此检查。使用 OpenAI 官方接口时，可启用本机 Clash 代理并填写实际 HTTP / Mixed 端口，无需关闭 Fake-IP。',
+    AGENT_PROXY_SERVER_UPDATE_REQUIRED: '当前服务端尚不支持 Clash 代理。请更新前端后执行本栏服务端安装命令，再重启酒馆；仅刷新页面不够。',
+    PROXY_URL_INVALID: '请填写完整本机代理地址，例如 http://127.0.0.1:实际端口，把“实际端口”替换为 Clash 的 HTTP / Mixed 端口数字；不支持代理用户名或密码。',
+    PROXY_LOOPBACK_REQUIRED: '代理地址只允许本机 127.0.0.1 或 [::1]；请填写 Clash 的本机 HTTP / Mixed 端口。',
+    PROXY_OPENAI_ONLY: '此本机代理选项目前只支持 https://api.openai.com 的官方接口。请核对 API 地址；其他接口须关闭此选项。',
+    PROXY_CONNECTION_FAILED: '无法连接本机 Clash 代理。请确认 Clash 正在运行，且填写的是酒馆可访问的 HTTP / Mixed 端口。',
+    PROXY_AUTH_REQUIRED: 'Clash 代理要求用户名和密码；当前功能不支持代理鉴权。请使用无需鉴权的本机回环代理入口。',
+    PROXY_CONNECT_REJECTED: 'Clash 拒绝了代理隧道。请检查 HTTP / Mixed 端口及 OpenAI 的代理路由；不要填写 SOCKS 单独端口或控制面板端口。',
+    PROXY_TLS_FAILED: '通过 Clash 连接 OpenAI 时证书验证失败。请检查系统时间、代理节点和证书配置；不会跳过证书验证。',
+    PROXY_TIMEOUT: '通过本机 Clash 连接超时。请检查代理端口和节点；不会自动改走直连或重试付费调用。',
+    PROXY_ABORTED: '本次代理连接已取消，未自动重试。',
   };
   if (messages[code]) return messages[code];
   if (/401/.test(code)) return '接口拒绝了密钥，请检查密钥是否正确，以及是否属于当前服务商。';

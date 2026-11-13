@@ -20,6 +20,51 @@ async function fixture(t, responder) {
     return { directory, server, service, config };
 }
 
+test('explicit local proxy persists without exposing keys or resetting spend; omission inherits only the same endpoint', async t => {
+    const { service, config, directory } = await fixture(t, (_req, res) => res.end('{}'));
+    const official = { ...config, endpoint: 'https://api.openai.com/v1/chat/completions', allowLocal: false, proxyUrl: 'http://localhost:7892' };
+    const status = await service.configure(official);
+    assert.equal(status.capabilities.agentProxy, true);
+    assert.equal(status.config.proxyUrl, 'http://127.0.0.1:7892/');
+    assert.doesNotMatch(JSON.stringify(status), /sk-test-secret/);
+    service.state.ledger = { calls: 2, chargedOrReserved: 0.12, currency: 'USD' };
+    await service.persist();
+    const reloaded = new AgentService(directory);
+    assert.equal((await reloaded.status()).config.proxyUrl, status.config.proxyUrl);
+    const { proxyUrl: _proxy, apiKey: _key, ...sameEndpoint } = official;
+    const saved = await reloaded.configure(sameEndpoint);
+    assert.equal(saved.config.proxyUrl, status.config.proxyUrl);
+    assert.equal(saved.config.hasKey, true);
+    assert.deepEqual(saved.ledger, service.state.ledger);
+    assert.equal((await reloaded.configure({ ...sameEndpoint, proxyUrl: '' })).config.proxyUrl, '');
+    await reloaded.configure(official);
+    const changed = await reloaded.configure({ ...sameEndpoint, endpoint: config.endpoint, apiKey: config.apiKey, allowLocal: true });
+    assert.equal(changed.config.proxyUrl, '');
+    assert.deepEqual(changed.ledger, service.state.ledger);
+});
+
+test('invalid proxy and unsupported target reject config/check before any network or spend', async t => {
+    let calls = 0;
+    const { service, config } = await fixture(t, (_req, res) => { calls++; res.end('{}'); });
+    const official = { ...config, endpoint: 'https://api.openai.com/v1/chat/completions', allowLocal: false };
+    await assert.rejects(service.configure({ ...config, proxyUrl: 'http://127.0.0.1:7892' }), /PROXY_OPENAI_ONLY/);
+    await assert.rejects(service.configure({ ...official, proxyUrl: 'http://name:password@127.0.0.1:7892' }), /PROXY_URL_INVALID/);
+    await assert.rejects(service.configure({ ...official, proxyUrl: 'http://192.168.0.1:7892' }), /PROXY_LOOPBACK_REQUIRED/);
+    await assert.rejects(service.checkAgent({ interfaceType: 'openai', endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, allowLocal: true, proxyUrl: 'http://127.0.0.1:7892' }), /PROXY_OPENAI_ONLY/);
+    const status = await service.status();
+    assert.equal(status.configured, false); assert.equal(status.ledger.calls, 0); assert.equal(calls, 0);
+});
+
+test('persisted proxy route revalidates before paid-call reservation', async t => {
+    const { service, config } = await fixture(t, (_req, res) => res.end('{}'));
+    await service.configure(config);
+    service.state.config.proxyUrl = 'http://127.0.0.1:7892';
+    await assert.rejects(service.run({ diagnostics: {} }), /PROXY_OPENAI_ONLY/);
+    assert.equal((await service.status()).ledger.calls, 0);
+    assert.equal((await service.status()).ledger.chargedOrReserved, 0);
+    assert.equal(service.state.records.length, 0);
+});
+
 test('Agent is disabled without a priced positive budget; no network call', async t => {
     let calls = 0;
     const { service, config } = await fixture(t, (_req, res) => { calls++; res.end('{}'); });
@@ -231,7 +276,7 @@ test('unsaved Agent check sends only GET model query, uploads no diagnostic and 
     const after = await service.status();
     assert.deepEqual(after.ledger, before.ledger); assert.equal(after.configured, false); assert.deepEqual(service.state.records, []);
     await assert.rejects(fs.access(path.join(directory, '.cache-lens/server-state.json')), { code: 'ENOENT' });
-    assert.equal(after.serverVersion, '0.1.1'); assert.equal(after.capabilities.agentCheck, true);
+    assert.equal(after.serverVersion, '0.1.8'); assert.equal(after.capabilities.agentCheck, true);
     assert.deepEqual(after.capabilities.agentCheckInterfaces, ['openai']);
 });
 

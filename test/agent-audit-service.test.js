@@ -57,7 +57,7 @@ async function serviceFixture(t, responder, calls = 40) {
     return service;
 }
 
-test('full paginated audit survives the existing server 0.1.1 transport without losing metadata or exposing private fields', async t => {
+test('full paginated audit survives the server transport without losing metadata or exposing private fields', async t => {
     const packet = createAuditPacket(largeReport(), { plan: { canApply: true, status: 'candidate',
         counts: { selectedEntries: 3, selectedGroups: 1 }, exclusions: [],
         input: { upperBound: 10000, ceiling: 20000, withinLimit: true, exact: false } } });
@@ -72,7 +72,7 @@ test('full paginated audit survives the existing server 0.1.1 transport without 
             choices: [{ message: { content: JSON.stringify({ expectedVersion: 1, reason: final ? '综合检查完成；只选择本地候选。' : '已检查本页；尚无上游缓存证据。',
                 operations: final ? [{ type: 'select_candidate', candidateId: 'current-batch' }] : [] }) } }] }));
     });
-    assert.equal(SERVER_VERSION, '0.1.1');
+    assert.equal(SERVER_VERSION, '0.1.8');
     const result = await runAgentAudit({ packet, maxCalls: 40, canContinue: async () => true,
         callAgent: async payload => { const reply = await service.run(payload); billed.push(reply.record); return reply; } });
     assert.equal(result.status, 'complete', result.reason);

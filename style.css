@@ -3,3 +3,4 @@
 #cache-lens-panel .cl-wide{grid-column:1/-1}#cache-lens-panel .cl-agent-grid input{font-size:14px;text-align:left}#cache-lens-panel [data-id="agentConnection"],#cache-lens-panel [data-id="agentStatus"]{margin:8px 0}
 #cache-lens-panel .cl-diagnostic-summary{white-space:pre-line;overflow-wrap:anywhere;line-height:1.65;margin:10px 0}
 #cache-lens-panel [data-id="auditResult"]{font:inherit;line-height:1.7;max-height:60vh}#cache-lens-panel button:disabled{opacity:.5;cursor:default}
+#cache-lens-panel .cl-action-feedback{flex-basis:100%;font-size:13px;overflow-wrap:anywhere;padding:4px 2px;white-space:pre-line}

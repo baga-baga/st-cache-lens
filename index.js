@@ -11,6 +11,7 @@ import { batchSummary } from './adapters/batch-view.js';
 import { summarizeBatchPlan, formatPlanRejections } from './adapters/batch-plan-report.js';
 import { createAuditPacket, runAgentAudit } from './adapters/agent-audit.js';
 import { auditBudget } from './adapters/agent-audit-budget.js';
+import { boundedWait } from './adapters/bounded-wait.js';
 import { runBatchPolicy, EMPTY_BATCH_POLICY, BATCH_ALGORITHM } from './adapters/batch-runner.js';
 import { observationLayer, ledgerRecords, pricesFor, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence } from './adapters/reporting.js';
 import { hasObservedContext, normalizeUISources, worldSummary } from './adapters/ui-data.js';
@@ -32,7 +33,7 @@ const json = v => JSON.stringify(v, null, 2);
 const MAX_RECORDS = 30;
 const MAX_TOTAL_BYTES = 24 * 1024 * 1024;
 
-export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(), host = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings'), adapterFactory = installSTAdapter, storageNamespace = null, storage = globalThis.localStorage, locks = globalThis.navigator?.locks, setupCollector = async args => collectCurrentSetup(await getSetupInputs(args)) } = {}) {
+export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(), host = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings'), adapterFactory = installSTAdapter, storageNamespace = null, storage = globalThis.localStorage, locks = globalThis.navigator?.locks, operationTimeouts = {}, setupCollector = async args => collectCurrentSetup({...await getSetupInputs(args),signal:args.signal}) } = {}) {
   if (!context || !host) return null;
   if (document.getElementById('cache-lens-panel')) return null;
   const settings = { ...clone(defaults), ...clone(context.extensionSettings?.[KEY] || {}) };
@@ -44,12 +45,15 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let observationStore = null, archiveEnabled = false, archiveWrites = Promise.resolve();
   let batchSetup=null,batchReport=null,batchPlan=null,batchRecordId=null,batchTimer=null,batchDirty=false,batchScanning=false,batchEpoch=0,lastBatchResult=null;
   let auditController=null,auditResult=null,auditSelection=null;
+  const pendingActions=new Set();
+  let pendingAuditIntent=null;
+  const deadlines={read:15000,agent:120000,setup:30000,ready:10000,...operationTimeouts};
   const batchListeners=[];
   let committedSettings = clone({...settings,state:opt,memory});
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.6</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.7</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
@@ -140,6 +144,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   <details><summary>服务端实际请求与缓存断点</summary><p>安装并启动本地 relay 后，将酒馆该连接的 reverse proxy 指向它。relay 只能证明它实际发送的请求，中转内部二次转换仍不可见。</p><div class="cl-grid"><label>观察器 ID<input data-id="observerId" value="main" placeholder="main 或 summary"></label><label>relay 地址<input data-id="relayURL" value="http://127.0.0.1:8937"></label><label>本地 relay 令牌<input data-id="relayToken" type="password" autocomplete="off"></label></div><button data-action="save-observer">连接本地观察器</button><button data-action="load-policy">读取当前断点策略</button><label>策略 JSON<textarea data-id="policy" rows="8" spellcheck="false"></textarea></label><div class="cl-toolbar"><button data-action="draft-policy">从两次实际请求提取稳定 system 前缀</button><button data-action="apply-policy">应用已核实接口的断点策略</button><button data-action="rollback-policy">恢复上一断点策略</button><button data-action="recover-policy">恢复未完成的策略事务</button></div><label><input type="checkbox" data-id="verifiedEndpoint">我已核对当前上游确实支持该 Anthropic Messages 缓存规则（包括中转兼容性）</label><pre data-id="policyStatus"></pre></details>
   </details>`;
   host.append(root);
+  root.querySelectorAll('button').forEach(button=>{button.type='button';});
   function limits() { return {maxInputTokens:Number(settings.maxInputTokens),contextTokens:Number(settings.contextTokens),outputReserveTokens:Number(settings.outputReserveTokens)}; }
   function value(id) { return $(root, `[data-id="${id}"]`).value; }
   function set(id, val) { $(root, `[data-id="${id}"]`).value = val ?? ''; }
@@ -186,12 +191,13 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     const names=new Map((batchPlan?.profile?.blocks||[]).map(block=>[block.id,String(block.source?.name||block.id).slice(0,80)]));
     out('batchPreview',batchPlan?.groups?.length?batchPlan.groups.map((group,i)=>`第 ${i+1} 组（${group.role} / ${group.scope}）\n原顺序：${group.before.map(id=>names.get(id)||id).join(' → ')}\n新顺序：${group.after.map(id=>names.get(id)||id).join(' → ')}`).join('\n\n').slice(0,12000)+'\n\n正文增删：0；原书设置修改：0。仅为离线候选，是否允许应用见上方校验结果。':'没有待预览的合格排序范围。');
   }
-  async function readBatchSetup() {return setupCollector({context:liveContext(),snapshot:adapter?.getSnapshot?.(),getContext:liveContext});}
-  async function scanBatch({follow=false,audit=false}={}) {
+  async function readBatchSetup(signal) {return boundedWait(readSignal=>setupCollector({context:liveContext(),snapshot:adapter?.getSnapshot?.(),getContext:liveContext,signal:readSignal}),{timeoutMs:deadlines.setup,signal,message:'读取本机世界书或配置超时；本次扫描已结束，未调用模型。请检查酒馆连接后再试。'});}
+  async function scanBatch({follow=false,audit=false,signal}={}) {
     assertIdle();batchScanning=true;batchDirty=false;const scanEpoch=batchEpoch;
     out('batchSummary','正在读取当前绑定的世界书、预设和扩展来源；不会生成模型请求。');
     try {
-      const setup=await readBatchSetup();assertIdle();if(disposed||scanEpoch!==batchEpoch)return null;
+      const setup=await readBatchSetup(signal);assertIdle();if(disposed||signal?.aborted||scanEpoch!==batchEpoch)return null;
+      await new Promise(resolve=>setTimeout(resolve,0));assertIdle();if(disposed||signal?.aborted||scanEpoch!==batchEpoch)return null;
       const report=analyzeSetup(setup,{records:records.filter(r=>r.purpose!=='agent'),limits:{...limits(),...(audit?{maxAnalysisRecords:100,maxAnalysisSourcesPerRecord:2000}:{})}});
       const r=batchCurrentRecord(setup);
       const candidate=buildBatchPlan({record:r,setup:{...setup,batchAuthorized:true},limits:limits()});
@@ -240,28 +246,34 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     tx.rollback=true;tx.rolledBackAt=new Date().toISOString();await persist();if(!settings.batchFollow){clearTimeout(batchTimer);batchDirty=false;}syncBoundaryInputs();render();status('已恢复上一批量设置；后续请求使用恢复后的策略，原世界书与预设未被改写。');
   }
   async function reviewBatchWithAgent() {
+    const controller=new AbortController();auditController=controller;
+    $(root,'[data-action="audit-stop"]').disabled=false;
+    try{return await performBatchAudit(controller);}
+    finally{if(auditController===controller)auditController=null;if(!disposed)$(root,'[data-action="audit-stop"]').disabled=true;}
+  }
+  async function performBatchAudit(controller) {
     assertIdle();assertFresh();auditSelection=null;auditResult=null;
     $(root,'[data-action="audit-apply"]').hidden=true;$(root,'[data-action="audit-export"]').hidden=true;
     out('auditResult','');out('auditProgress','正在本机采集全部绑定配置并核对覆盖范围……');
-    const report=await scanBatch({audit:true});if(!report)throw new Error('采集期间配置已变化，请稍后再运行。');
+    const report=await scanBatch({audit:true,signal:controller.signal});if(!report)throw new Error('采集已停止或配置已变化；未调用模型。');
+    await new Promise(resolve=>setTimeout(resolve,0));if(controller.signal.aborted)throw new Error('检查已停止；未调用模型。');assertIdle();assertFresh();
     const packet=createAuditPacket(report,{plan:batchPlan,limits:limits(),setup:batchSetup,records,shareExcerpts:$(root,'[data-id="auditExcerpts"]').checked});
     out('auditProgress',`已本机读取 ${report.counts.entries} 条世界书、${report.counts.presetPrompts} 项预设、${report.counts.extensionSources} 个扩展来源。Agent 将分 ${packet.pages.length} 批检查，再统一汇总，共需 ${packet.requiredCalls} 次调用。`);
     if(packet.tooManyPages)throw new Error('当前配置超过单次 Agent 检查的 24 批上限；已保留本机报告，尚未调用模型。');
     if(settings.maxTests<1||settings.maxCost<=0)throw new Error('未配置 Agent 付费预算；本机采集已完成，请在下方 Agent 设置保存预算后再点击。');
     const epoch=batchEpoch,revision=batchSetup.revision?.fingerprint,recordId=batchRecordId,snapshot=savedSnapshot,share=$(root,'[data-id="auditExcerpts"]').checked;
-    const controller=new AbortController();auditController=controller;
     $(root,'[data-action="audit-stop"]').disabled=false;busy=true;
     const stillCurrent=async()=>{
       if(disposed||controller.signal.aborted||batchEpoch!==epoch||inFlight||adapter?.getSnapshot?.().generation)return false;
       try{assertFresh();}catch{return false;}
       if(savedSnapshot!==snapshot||share!==$(root,'[data-id="auditExcerpts"]').checked)return false;
-      const fresh=await readBatchSetup();
+      const fresh=await readBatchSetup(controller.signal);
       if(disposed||controller.signal.aborted||batchEpoch!==epoch||inFlight||adapter?.getSnapshot?.().generation)return false;
       try{assertFresh();}catch{return false;}
-      return savedSnapshot===snapshot&&share===$(root,'[data-id="auditExcerpts"]').checked&&fresh.revision?.fingerprint===revision&&batchCurrentRecord(fresh)?.id===recordId;
+      return savedSnapshot===snapshot&&share===$(root,'[data-id="auditExcerpts"]').checked&&fresh.revision?.fingerprint===revision&&(batchCurrentRecord(fresh)?.id??null)===recordId;
     };
     try {
-      serverStatus=await api('status');if(!await stillCurrent())throw new Error('检查已停止或配置已改变；尚未调用 Agent。');
+      serverStatus=await api('status',undefined,{signal:controller.signal});if(!await stillCurrent())throw new Error('检查已停止或配置已改变；尚未调用 Agent。');
       const budget=auditBudget(packet,serverStatus,settings);out('auditProgress',budget.reason);if(!budget.ok)throw new Error(budget.reason);
       const result=await runAgentAudit({packet,maxCalls:budget.remainingCalls,signal:controller.signal,canContinue:stillCurrent,
         onProgress:p=>{if(!disposed)out('auditProgress',`Agent 已检查 ${p.reviewedPages} / ${p.totalPages} 批；已发起 ${p.calls} 次调用。${p.phase==='synthesis'?'正在统一汇总证据与方案。':'可以停止后续调用；正在进行的一次仍可能计费。'}`);},
@@ -368,7 +380,15 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     out('rules',settings.rules);out('memory',renderMemory(memory));renderBatch();
   }
   function download(name, content) { const url=URL.createObjectURL(new Blob([json(content)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000); }
-  async function api(path,body) { const headers=context.getRequestHeaders?.()||{'Content-Type':'application/json'};const r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body)});if(!r.ok){let code='';try{const data=await r.json();if(/^[A-Z0-9_]{1,100}$/.test(data.error))code=data.error;}catch{}const error=new Error(agentSetupError(code,r.status));error.code=code;error.httpStatus=r.status;throw error;}return r.json(); }
+  async function api(path,body,{signal}={}) {
+    const paid=path==='agent';
+    return boundedWait(async requestSignal=>{
+      const headers=context.getRequestHeaders?.()||{'Content-Type':'application/json'};
+      const r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body),signal:requestSignal});
+      if(!r.ok){let code='';try{const data=await r.json();if(/^[A-Z0-9_]{1,100}$/.test(data.error))code=data.error;}catch{}const error=new Error(agentSetupError(code,r.status));error.code=code;error.httpStatus=r.status;throw error;}
+      return await r.json();
+    },{timeoutMs:paid?deadlines.agent:deadlines.read,signal,message:paid?'等待 Agent 返回超时；已停止后续调用，不会自动重试。服务端这次调用仍可能完成并计费，请先刷新费用记录。':'酒馆服务端响应超时；未自动重试，请检查酒馆是否仍在运行。'});
+  }
   async function checkAgentServer() {
     serverStatus=await api('status');
     if(!serverStatus.capabilities?.agentCheck)throw new Error('服务端版本较旧。请执行本栏的安装命令更新服务端并重启酒馆。');
@@ -550,7 +570,37 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     async 'recover-policy'(){assertIdle();assertFresh();const intent=settings.pendingRelayIntent;if(!intent)throw new Error('没有待恢复事务');const result=await recoverPolicyIntent({intent,...relayCallbacks(intent.observerId)});out('policyStatus',result);if(result.intentPending)throw new Error('恢复尚未完成：'+result.status+'。未覆盖并发修改，请核对 relay 当前策略。');}
 
   };
-  root.addEventListener('click',event=>{const action=event.target.closest('[data-action]')?.dataset.action;if(!action)return;if(action==='audit-stop'){auditController?.abort();out('auditProgress','已要求停止后续 Agent 调用；正在进行的一次仍可能计费，完成后保留已收到结果。');return;}actionQueue=actionQueue.then(async()=>{await ready;await actions[action]?.();}).catch(error=>status(error.message,true));});
+  root.addEventListener('click',event=>{
+    const button=event.target.closest?.('[data-action]'),action=button?.dataset.action;if(!action)return;event.preventDefault();
+    if(action==='audit-stop'){if(pendingAuditIntent)pendingAuditIntent.cancelled=true;auditController?.abort();out('auditProgress','已要求停止后续 Agent 调用；正在进行的一次仍可能计费，完成后保留已收到结果。');return;}
+    if(pendingActions.has(action))return;
+    let feedback=root.querySelector(`[data-feedback="${action}"]`);
+    if(!feedback){feedback=document.createElement('div');feedback.dataset.feedback=action;feedback.className='cl-action-feedback';feedback.setAttribute('role','status');button.after(feedback);}
+    const paid=['batch-agent','agent'].includes(action);
+    if(paid&&(pendingActions.has('batch-agent')||pendingActions.has('agent'))){feedback.textContent='已有 Agent 检查正在等待或运行，未新增付费调用。';return;}
+    const intent=action==='batch-agent'?{cancelled:false}:null;
+    if(intent){pendingAuditIntent=intent;$(root,'[data-action="audit-stop"]').disabled=false;out('auditProgress','已收到点击，正在准备检查；不会重复排入付费任务。');}
+    const label=button.textContent;pendingActions.add(action);button.disabled=true;button.setAttribute('aria-busy','true');button.textContent='处理中…';
+    feedback.textContent=pendingActions.size>1?'已收到点击，等待当前操作结束。':'已收到点击，正在准备…';feedback.classList.remove('cl-error');
+    if(action==='check-agent'||action==='check-server')out('agentConnection','正在连接酒馆服务端…');
+    const started=Date.now(),heartbeat=setInterval(()=>{if(!disposed)feedback.textContent=`仍在处理，已等待 ${Math.floor((Date.now()-started)/1000)} 秒。请勿重复点击。`;},5000);
+    actionQueue=actionQueue.then(async()=>{
+      await boundedWait(()=>ready,{timeoutMs:deadlines.ready,message:'初始化等待超时；本次点击已取消，未调用模型。请关闭其他酒馆标签页后刷新。'});
+      if(disposed||intent?.cancelled)throw new Error('检查已停止；未开始新的调用。');
+      await new Promise(resolve=>setTimeout(resolve,0));
+      if(disposed||intent?.cancelled)throw new Error('检查已停止；未开始新的调用。');
+      await actions[action]?.();
+      if(!disposed)feedback.textContent=action==='batch-agent'&&auditResult?.status!=='complete'?'检查已结束，查看本栏的停止原因和已完成结果。':'操作已完成，结果显示在本栏。';
+    }).catch(error=>{
+      if(disposed)return;status(error.message,true);feedback.textContent=error.message;feedback.classList.add('cl-error');
+      if(action==='batch-agent')out('auditProgress',error.message);
+      if(action==='check-agent'||action==='check-server')out('agentConnection',error.message);
+      if(action==='batch-scan')out('batchSummary',error.message);
+    }).finally(()=>{
+      clearInterval(heartbeat);pendingActions.delete(action);button.disabled=false;button.removeAttribute('aria-busy');button.textContent=label;
+      if(intent&&pendingAuditIntent===intent){pendingAuditIntent=null;if(!disposed)$(root,'[data-action="audit-stop"]').disabled=true;}
+    });
+  });
   $(root,'[data-id="layer"]').addEventListener('change',()=>{selectedId=null;render();});
   $(root,'[data-id="record"]').addEventListener('change',event=>{selectedId=event.target.value;render();});
   $(root,'[data-id="purpose"]').addEventListener('change',event=>{const r=current();if(r){r.purpose=event.target.value;r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;const bill=billingRecords.find(b=>b.id===r.id);if(bill){bill.purpose=r.purpose;bill.manualPurpose=true;}saveObservations();render();}});

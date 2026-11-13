@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ledgerRecords, observationLayer, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence, numericUsage, pricedObservation } from '../adapters/reporting.js';
+import { ledgerRecords, observationLayer, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence, numericUsage, pricedObservation, sanitizeBatchResult } from '../adapters/reporting.js';
 import { evaluateTrial } from '../core/evaluation.js';
 import { createProfile, previewProposal } from '../core/optimizer.js';
 const prices={currency:'USD',source:'https://price.example/table',updatedAt:'2026-11-12',input:4,output:20,cacheRead:.2,cacheWrite:5};
@@ -100,4 +100,39 @@ test('redacted usage-less Claude diagnostic imports without silently discarding 
  const [record]=importEvidence(data);assert.ok(record);assert.equal(record.usage,null);assert.equal(record.observationLevel,'imported');assert.equal(record.reportedStatus,'http-error');assert.equal(record.diagnostic.firstDifference.path,'messages[6].content');assert.equal(record.diagnostic.firstDifference.offset,31706);
  assert.equal(record.archived,true);assert.deepEqual(record.body,{});assert.match(record.observationNotice,/不能重新比较或优化/);
  const exported=redactedExport({records:[record],diagnosticFor:r=>r.diagnostic});assert.equal(exported.records[0].diagnostic.stablePrefixCharacters,33342);
+});
+
+const batchOutcome = (extra={}) => ({algorithm:'activated-world-info-stable-first-v1',policyVersion:3,selectedEntries:12,selectedGroups:2,applied:true,input:{upperBound:150000,ceiling:180000,exact:false},...extra});
+
+test('batch outcome export is a bounded allowlist, strips narrative, and never upgrades a bound to exact tokens',()=>{
+ const raw=batchOutcome({reason:'PRIVATE_REASON',name:'PRIVATE_BOOK',method:'PRIVATE_METHOD',expectedImpact:{content:'PRIVATE_IMPACT'},input:{upperBound:150000,ceiling:180000,exact:true,method:'PRIVATE_TOKENIZER',apiKey:'PRIVATE_KEY'}});
+ const clean=sanitizeBatchResult(raw);
+ assert.deepEqual(clean,batchOutcome());
+ assert.deepEqual(sanitizeBatchResult(clean),clean);
+ assert.equal(JSON.stringify(clean).includes('PRIVATE'),false);
+ assert.ok(JSON.stringify(clean).length<300);
+ const exported=redactedExport({records:[observed('one',{usage:null,batchResult:raw})]});
+ assert.deepEqual(exported.records[0].batchResult,clean);
+ assert.equal(exported.records[0].usage,null);
+ assert.equal(JSON.stringify(exported).includes('PRIVATE'),false);
+ assert.equal(raw.input.exact,true);
+});
+
+test('malformed batch outcomes cannot inject algorithms or non-finite, negative, fractional and unsafe counts',()=>{
+ for(const invalid of [null,[],{...batchOutcome(),algorithm:'PRIVATE_ALGORITHM'},batchOutcome({policyVersion:Infinity}),batchOutcome({policyVersion:-1}),batchOutcome({selectedEntries:1.5}),batchOutcome({selectedEntries:Number.MAX_SAFE_INTEGER+1}),batchOutcome({selectedGroups:NaN}),batchOutcome({applied:'true'})]) assert.equal(sanitizeBatchResult(invalid),null);
+ for(const upperBound of [Infinity,NaN,-1,Number.MAX_SAFE_INTEGER+1,'150000']) assert.equal(sanitizeBatchResult(batchOutcome({input:{upperBound,ceiling:180000}})).input,undefined);
+ assert.equal(sanitizeBatchResult(batchOutcome({input:{upperBound:100,ceiling:Infinity}})).input,undefined);
+ assert.deepEqual(sanitizeBatchResult(batchOutcome({policyVersion:0,selectedEntries:0,selectedGroups:0,applied:false,input:{upperBound:0,ceiling:0}})),batchOutcome({policyVersion:0,selectedEntries:0,selectedGroups:0,applied:false,input:{upperBound:0,ceiling:0,exact:false}}));
+ assert.equal(redactedExport({records:[observed('invalid',{batchResult:{algorithm:'PRIVATE'}})]}).records[0].batchResult,undefined);
+});
+
+test('redacted batch outcome survives export/import while keeping imported evidence untrusted and usage unknown',()=>{
+ const exported=redactedExport({records:[observed('one',{usage:null,batchResult:batchOutcome()})]});
+ const [imported]=importEvidence(exported,{idPrefix:'batch-import'});
+ assert.deepEqual(imported.batchResult,batchOutcome());
+ assert.equal(imported.imported,true);assert.equal(imported.observationLevel,'imported');assert.equal(imported.archived,true);assert.equal(imported.usage,null);
+ assert.equal(imported.batchResult.cacheSavingsVerified,undefined);
+ assert.deepEqual(redactedExport({records:[imported]}).records[0].batchResult,batchOutcome());
+ const [metadataOnly]=importEvidence({redacted:true,records:[{batchResult:batchOutcome()}]});
+ assert.equal(metadataOnly.archived,true);assert.equal(metadataOnly.usage,null);assert.deepEqual(metadataOnly.body,{});
 });

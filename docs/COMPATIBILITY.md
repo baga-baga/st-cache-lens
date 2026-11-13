@@ -1,6 +1,6 @@
 # 兼容范围与源码核验
 
-核验日期：2026-11-12。源码基线是 **SillyTavern 1.19.0**，官方 `release` 分支提交 `06bde939fb1e9c4c8d8641d810f0a916b5bce127`。本包要求 Node.js 20 或更新版本，无额外运行时 npm 依赖。后续版本不能仅凭版本号认定完全兼容。
+基础核验日期：2026-11-12；批量读取接口于 2026-11-13 再核验。源码基线是 **SillyTavern 1.19.0**，官方 `release` 分支提交 `06bde939fb1e9c4c8d8641d810f0a916b5bce127`。本包要求 Node.js 20 或更新版本，无额外运行时 npm 依赖。后续版本不能仅凭版本号认定完全兼容。
 
 完整开发测试使用锁文件中的 jsdom 26.1 开发依赖，先运行 `npm ci --ignore-scripts`。用户安装和正常运行不需要这些开发依赖。优化提交需要浏览器 Web Locks：同机使用 localhost，远程使用 HTTPS；缺少安全上下文或锁能力时降级只读观察。持久化按酒馆账号隔离，使用 localStorage、精确 CAS，并镜像到酒馆扩展设置。
 
@@ -13,6 +13,9 @@
 | 前端请求设置 | [openai.js L3146](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/openai.js#L3146) | `CHAT_COMPLETION_SETTINGS_READY` 位于 `generate_data` 构造后、`fetch('/api/backends/chat-completions/generate')` 前。其他扩展仍可能在其后改变数据。 |
 | 世界书激活 | [world-info.js L902](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/world-info.js#L902) | `WORLD_INFO_ACTIVATED` 提供实际激活条目数组；只在非 dry-run 且激活集合非空时发出，不能把缺少事件理解成明确的零激活。 |
 | 世界书配置 | [world-info.js L65](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/world-info.js#L65)、[位置枚举 L855](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/world-info.js#L855) | 支持常驻、关键词、向量标记、递归、深度、概率、分组、预算与不同注入位置。诊断展示原值；没有猜测第三方插件字段含义。 |
+| 当前绑定书读取 | [st-context.js L278](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/st-context.js#L278)、[world-info.js L4477](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/world-info.js#L4477) | 使用 `loadWorldInfo`，结合全局选择、角色主/附加书、聊天及人格绑定收集当前范围。`getWorldInfoNames` 是全部可用书名，不能当作当前绑定集合。 |
+| 当前预设顺序 | [openai.js L535](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/openai.js#L535)、[PromptManager.js L1207](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/PromptManager.js#L1207) | 读取当前 `chatCompletionSettings.prompts` 与公开模块导出的 `promptManager` 活跃角色顺序；不假定卡片 ID 就是全局预设顺序 ID。模块能力缺失时报告不完整，不猜排序。 |
+| 原生世界书排序 | [world-info.js L5200](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/public/scripts/world-info.js#L5200) | 常见 before/after 注入路径先降序遍历再 `unshift`，高 order 在最终文本更靠后；order 也影响预算竞争等行为，并非纯显示值。批量策略因此不改原书 order，仅检查已激活请求副本。其他位置及未知缓存插件不能套用同一规则。 |
 | Claude 转换 | [chat-completions.js L230](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/src/endpoints/backends/chat-completions.js#L230) | 服务端调用 `convertClaudeMessages`，组装 `system/messages/tools`。前端内容块、系统消息与最终请求可能不同。 |
 | 酒馆原生缓存配置 | [chat-completions.js L106](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/src/endpoints/backends/chat-completions.js#L106)、[prompt-converters.js L985](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/src/prompt-converters.js#L985) | `claude.enableSystemPromptCache`、`claude.cachingAtDepth`、`claude.extendedTTL` 是服务端启动时读取的设置。原生深度缓存可在两个消息位置写断点，不应未经核验叠加更多断点。 |
 | 可选服务端插件 | [plugin-loader.js L101](https://github.com/SillyTavern/SillyTavern/blob/06bde939fb1e9c4c8d8641d810f0a916b5bce127/src/plugin-loader.js#L101) | 支持 `package.json.main`、`info`、`init(router)`。端点挂载 `/api/plugins/cache-lens/…`，需设置 `enableServerPlugins: true` 后重启。 |
@@ -30,6 +33,16 @@
 | 酒馆助手、类脑缓存插件、用户自动摘要插件 | 已公开来源快照/显式适配器；未确认实现时只读 | 准确仓库、版本、设置导出；没有宣称已支持它们的内部写入 |
 
 本地 relay 观察的是“酒馆转换后送到已配置上游”的请求。上游若为中转站，中转站内部再次转换、号池路由与计费逻辑仍不可见。没有 relay 或导入的服务端证据时，界面应继续显示“仅观察到前端请求”。
+
+## 0.1.3 批量功能的实际边界
+
+免费扫描优先用 `SillyTavern.getContext()` 的公开信息，并读取已核验的 `world-info.js` / `openai.js` 模块导出作为桥接；不访问未确认第三方插件的私有状态。报告读取当前实际预设，而非仅使用磁盘里同名预设。切卡、预设改变、世界书设置改变和角色编辑使旧报告失效，空闲后重新读取；不调用世界书 dry-run 触发器来模拟正常请求。
+
+采集默认限制为 64 本绑定书、20000 条条目、24MiB 本机快照，超出或缺书会显示不完整并禁止据此授权。请求分析另有数量与来源覆盖边界，不把未采集部分当成稳定。它能分析当前绑定范围，不会一次打开所有未选角色卡，更不会将所有书注入模型或上传 Agent。
+
+跨角色策略经用户一次启用后绑定正文接口与模型，运行时逐请求只处理已有 `WORLD_INFO_ACTIVATED` 来源、字节唯一匹配的相邻世界书片段。角色与卡片文本不会跨请求复用；预设及第三方记忆仍只读诊断。不同消息、角色、深度/注入范围、外层标签以及未知片段边界均不能跨越。它没有把 before-character 改为 after-character 等原生位置迁移能力。
+
+这些批量功能在前端运行，不需要 Agent、relay 或服务端重装。已有 0.1.1 服务端仍可提供预算受控的报告复核；复核返回修改操作会拒绝。单个请求若未通过字节保护则保留原请求，并不代表实测 tokens 已超限。未在用户设备、第三方插件组合或真实 Claude/DeepSeek 付费请求上确认缓存与剧情效果。
 
 ## 安装脚本的保护范围
 

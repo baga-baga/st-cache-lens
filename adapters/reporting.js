@@ -16,6 +16,27 @@ export function numericUsage(value,depth=0) {
   const entries=Object.entries(value).flatMap(([key,val])=>usageKeys.has(key)&&safeNumber(val)?[[key,val]]:usageObjects.has(key)&&val&&typeof val==='object'?[[key,numericUsage(val,depth+1)||{}]]:[]);
   return entries.length?Object.fromEntries(entries):null;
 }
+/** Local transformation metadata only; never proof of a server cache hit or savings. */
+export function sanitizeBatchResult(value) {
+  const count = number => Number.isSafeInteger(number) && number >= 0;
+  const bound = number => safeNumber(number) && number <= Number.MAX_SAFE_INTEGER;
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || value.algorithm !== 'activated-world-info-stable-first-v1'
+      || !count(value.policyVersion) || !count(value.selectedEntries) || !count(value.selectedGroups)
+      || typeof value.applied !== 'boolean') return null;
+  const result = {
+    algorithm: 'activated-world-info-stable-first-v1',
+    policyVersion: value.policyVersion,
+    selectedEntries: value.selectedEntries,
+    selectedGroups: value.selectedGroups,
+    applied: value.applied,
+  };
+  if (value.input && typeof value.input === 'object' && !Array.isArray(value.input)
+      && bound(value.input.upperBound) && bound(value.input.ceiling)) {
+    result.input = { upperBound: value.input.upperBound, ceiling: value.input.ceiling, exact: false };
+  }
+  return result;
+}
 function safeBill(bill) { return bill&&safeNumber(bill.amount)&&/^[A-Z]{3}$/.test(bill.currency)?{amount:bill.amount,currency:bill.currency,evidence:'user-imported-platform-bill'}:null; }
 
 export function observationLayer(record) {
@@ -106,9 +127,9 @@ function safeSource(source) {
 }
 export function redactedExport({records=[],prices={},history=[],diagnosticFor=()=>({})}={}) {
   return {schemaVersion:1,redacted:true,compatibility:'SillyTavern 1.19.0',notice:'No prompt text, source names, history reasons, endpoint credentials or raw arbitrary metadata is included.',
-    records:records.map((r,i)=>({id:`record-${i+1}`,model:label(r.model),provider:label(r.provider),interfaceType:label(r.interfaceType),purpose:purposes.has(r.purpose)?r.purpose:'unknown',
+    records:records.map((r,i)=>{const batchResult=sanitizeBatchResult(r.batchResult);return {id:`record-${i+1}`,model:label(r.model),provider:label(r.provider),interfaceType:label(r.interfaceType),purpose:purposes.has(r.purpose)?r.purpose:'unknown',
       observationLevel:label(r.observationLevel),startedAt:timestamp(r.startedAt??r.time),latencyMs:safeNumber(r.latencyMs)?r.latencyMs:null,usage:numericUsage(r.usage),status:label(r.status),transformed:r.transformed===true,
-      platformBill:safeBill(r.platformBill),diagnostic:compactDiagnostic(diagnosticFor(r))})),
+      platformBill:safeBill(r.platformBill),diagnostic:compactDiagnostic(diagnosticFor(r)),...(batchResult?{batchResult}:{})};}),
     prices:Object.fromEntries(Object.entries(prices).map(([key,p])=>[label(key),Object.fromEntries([['currency',label(p.currency)],['source',safeSource(p.source)],['sourceProvided',!!p.source],['updatedAt',/^\d{4}-\d{2}-\d{2}/.test(p.updatedAt??'')?p.updatedAt:null],...priceKeys.filter(k=>safeNumber(p[k])).map(k=>[k,p[k]])])])),
     history:history.map((t,i)=>({revision:i+1,at:timestamp(t.at),operationCount:Array.isArray(t.proposal?.operations)?t.proposal.operations.length:null,rollback:!!t.rollback}))};
 }
@@ -122,7 +143,9 @@ export function importEvidence(data,{idPrefix=`import:${Date.now()}`}={}) {
   const items=Array.isArray(data)?data:Array.isArray(data?.records)?data.records:[data];
   if(items.length>200)throw new Error('一次最多导入 200 条记录。');
   return items.flatMap((item,i)=>{
-    if(!item||typeof item!=='object'||Array.isArray(item)||(!item.body&&!item.request&&!item.usage&&!item.platformBill&&!(data?.redacted===true&&item.diagnostic)))return [];
+    if(!item||typeof item!=='object'||Array.isArray(item))return [];
+    const batchResult=sanitizeBatchResult(item.batchResult);
+    if(!item.body&&!item.request&&!item.usage&&!item.platformBill&&!(data?.redacted===true&&(item.diagnostic||batchResult)))return [];
     const original=item.body??item.request??{};
     if(!original||typeof original!=='object'||Array.isArray(original))throw new Error('请求 body 必须是 JSON 对象。');
     const body=projectContext(original);
@@ -131,8 +154,8 @@ export function importEvidence(data,{idPrefix=`import:${Date.now()}`}={}) {
     const record={id:`${idPrefix}:${i}`,body:safeBody,provider:label(item.provider??item.interfaceType),interfaceType:label(item.interfaceType),model:label(item.model??original.model),
       purpose:purposes.has(item.purpose)?item.purpose:'unknown',observationLevel:'imported',imported:true,status:'imported',sources:[],usage:numericUsage(item.usage),platformBill:safeBill(item.platformBill),
       startedAt:timestamp(item.startedAt??item.time),latencyMs:safeNumber(item.latencyMs)?item.latencyMs:null,
-      redactedOnImport:state.redacted,observationNotice:state.redacted?'用户导入且已移除疑似凭据；内容已改变，不可用于证明原始前缀。':'用户导入证据；来源待核实，不能据此宣布实际节省。'};
-    if(data?.redacted===true&&item.diagnostic){record.diagnostic=compactDiagnostic(item.diagnostic);record.archived=true;record.reportedStatus=label(item.status);record.observationNotice='导入的脱敏诊断；保留原记录的用量和差异结论，未包含提示词原文，不能重新比较或优化。';}
+      redactedOnImport:state.redacted,observationNotice:state.redacted?'用户导入且已移除疑似凭据；内容已改变，不可用于证明原始前缀。':'用户导入证据；来源待核实，不能据此宣布实际节省。',...(batchResult?{batchResult}:{})};
+    if(data?.redacted===true&&(item.diagnostic||batchResult)){record.diagnostic=compactDiagnostic(item.diagnostic);record.archived=true;record.reportedStatus=label(item.status);record.observationNotice='导入的脱敏诊断；保留原记录的用量和差异结论，未包含提示词原文，不能重新比较或优化。';}
     if(item.prices){try{record.prices=validatePriceTable({imported:item.prices}).imported;}catch{/* Malformed price evidence stays unpriced. */}}
     return [record];
   });

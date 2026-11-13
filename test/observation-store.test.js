@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createObservationStore } from '../adapters/observation-store.js';
+import { redactedExport, importEvidence } from '../adapters/reporting.js';
 
 function memoryStorage() {
     const items = new Map();
@@ -197,4 +198,37 @@ test('replay, predicted and offline preview evidence remain synthetic through re
     const loaded = await make(storage).read();
     assert.equal(loaded.length, 3);
     assert.ok(loaded.every(item => item.synthetic === true));
+});
+
+test('batch outcome survives reload, same-id stale refresh and redacted export without text or false usage evidence', async () => {
+    const storage = memoryStorage(), store = make(storage);
+    const expected = { algorithm: 'activated-world-info-stable-first-v1', policyVersion: 4, selectedEntries: 10, selectedGroups: 2, applied: true, input: { upperBound: 150000, ceiling: 180000, exact: false } };
+    await store.upsert([record('batch-one', { usage: null, batchResult: { ...expected, reason: 'PRIVATE_REASON', names: ['PRIVATE_BOOK'], input: { ...expected.input, method: 'PRIVATE_METHOD', exact: true }, expectedImpact: { note: 'PRIVATE_IMPACT' } } })]);
+    const [first] = await make(storage).read();
+    assert.deepEqual(first.batchResult, expected);
+    assert.equal(first.usage, null);
+    assert.equal(JSON.stringify(first).includes('PRIVATE'), false);
+    await store.upsert([record('batch-one', { usage: null, batchResult: { algorithm: 'UNKNOWN_PRIVATE' } })]);
+    await store.upsert([record('batch-one', { usage: null })]);
+    const [reloaded] = await make(storage).read();
+    assert.deepEqual(reloaded.batchResult, expected);
+    const exported = redactedExport({ records: [reloaded] });
+    assert.deepEqual(exported.records[0].batchResult, expected);
+    await make(storage, { key: 'account:a:imported' }).upsert(importEvidence(exported, { idPrefix: 'import:batch' }));
+    const [imported] = await make(storage, { key: 'account:a:imported' }).read();
+    assert.deepEqual(imported.batchResult, expected);
+    assert.equal(imported.observationLevel, 'imported');
+    assert.equal(imported.imported, true);
+    assert.equal(imported.usage, null);
+    assert.equal(JSON.stringify([...storage.items.values()]).includes('PRIVATE'), false);
+});
+
+test('batch archive permits valid unapplied zero counts and rejects malformed outcomes', async () => {
+    const storage = memoryStorage(), store = make(storage);
+    const skipped = { algorithm: 'activated-world-info-stable-first-v1', policyVersion: 0, selectedEntries: 0, selectedGroups: 0, applied: false };
+    await store.upsert([record('skipped', { batchResult: skipped }), record('invalid', { batchResult: { ...skipped, selectedEntries: Infinity, reason: 'PRIVATE' } })]);
+    const loaded = await make(storage).read();
+    assert.deepEqual(loaded[0].batchResult, skipped);
+    assert.equal(loaded[1].batchResult, undefined);
+    assert.equal(JSON.stringify(loaded).includes('PRIVATE'), false);
 });

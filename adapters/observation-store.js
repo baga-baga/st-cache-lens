@@ -1,5 +1,5 @@
 /** Bounded local metadata archive. Narrative context and transport details never enter storage. */
-import { redactedExport, compactDiagnostic, numericUsage, observationLayer } from './reporting.js';
+import { redactedExport, compactDiagnostic, numericUsage, observationLayer, sanitizeBatchResult } from './reporting.js';
 
 const FORMAT = 'cache-lens-redacted-observations';
 const VERSION = 1;
@@ -89,6 +89,8 @@ async function sanitizeRecord(record) {
         diagnostic: sanitizeDiagnostic(record.diagnostic),
     };
     if (completionNames.has(record.completion)) result.completion = record.completion;
+    const batchResult = sanitizeBatchResult(record.batchResult);
+    if (batchResult) result.batchResult = batchResult;
     if (result.imported && safeStatus(record.reportedStatus) !== null) result.reportedStatus = safeStatus(record.reportedStatus);
     const prices = sanitizePrices(record.prices);
     if (prices) result.prices = prices;
@@ -162,6 +164,7 @@ export function createObservationStore({ storage, key, locks = globalThis.naviga
                         if (!record.prices && previous.prices) record.prices = previous.prices;
                         if (!record.platformBill && previous.platformBill) record.platformBill = previous.platformBill;
                         if (!record.reportedStatus && previous.reportedStatus) record.reportedStatus = previous.reportedStatus;
+                        if (!record.batchResult && previous.batchResult) record.batchResult = previous.batchResult;
                         if (!records[index].diagnostic) record.diagnostic = previous.diagnostic;
                         if (!record.startedAt) record.startedAt = previous.startedAt;
                         if (record.latencyMs === null) record.latencyMs = previous.latencyMs;

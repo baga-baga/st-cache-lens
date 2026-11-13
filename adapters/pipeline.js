@@ -35,6 +35,7 @@ export function transformWithProfile(body, profile, { record, binding } = {}) {
   if (!profile || profile.mode === 'diagnose' || !profile.blocks?.length) return body;
   const skip = reason => { if (record) record.structureTransformation = { applied: false, reason }; return body; };
   if (profile.binding && ['chatId', 'model', 'provider', 'purpose'].some(key => profile.binding[key] !== binding?.[key])) return skip('Request does not match the approved chat/model/provider/purpose scope');
+  if (profile.binding && ['characterId','groupId'].some(key => profile.binding[key]!==undefined&&(profile.binding[key]===null?binding?.[key]!==null:String(profile.binding[key])!==String(binding?.[key])))) return skip('Request does not match the approved character/group scope');
   const limits = profile.limits || {};
   if (!Number.isSafeInteger(limits.maxInputTokens) || limits.maxInputTokens <= 0 || !Number.isSafeInteger(limits.contextTokens) || limits.contextTokens <= 0) return skip('Explicit input and context limits are required');
   const reserve = limits.outputReserveTokens ?? 0;

@@ -212,14 +212,16 @@ export function installSTAdapter({ getContext = () => globalThis.SillyTavern?.ge
         const sources = getSources();
         const purpose = purposeFor(raw, context);
         const interfaceType = detectInterface(raw);
+        const requestBinding={chatId:String(safeCall(context.getCurrentChatId)??context.chatId??''),characterId:context.characterId===undefined||context.characterId===null?null:String(context.characterId),groupId:context.groupId===undefined||context.groupId===null?null:String(context.groupId)};
+        const transformMeta={sources:clone(sources),...purpose,interfaceType,...requestBinding,model:raw.model||'unknown',provider:raw.chat_completion_source||'unknown',snapshot:getSnapshot()};
         let outgoing = raw;
         if (transform) {
-            outgoing = await transform(clone(raw), { sources: clone(sources), ...purpose, interfaceType, chatId: String(safeCall(context.getCurrentChatId) ?? context.chatId ?? ''), model: raw.model || 'unknown', provider: raw.chat_completion_source || 'unknown', snapshot: getSnapshot() }) || raw;
+            outgoing = await transform(clone(raw), transformMeta) || raw;
             const validatedStructuralContent = validateTransform ? (await validateTransform(clone(raw), clone(outgoing), { sources: clone(sources), ...purpose, interfaceType })) === true : false;
             assertSafeTransform(raw, outgoing, { validatedStructuralContent });
         }
         const transformed = JSON.stringify(outgoing) !== JSON.stringify(raw);
-        const record = { id: makeId(), model: raw.model || 'unknown', chatId: String(safeCall(context.getCurrentChatId) ?? context.chatId ?? ''), provider: raw.chat_completion_source || 'unknown', interfaceType, ...purpose, observationLevel: 'frontend', observationNotice: '仅观察到前端请求；酒馆服务端转换与中转内部路由不可见', startedAt: new Date().toISOString(), timestamp: Date.now(), body: sanitizeRequest(outgoing), sources, world: getSnapshot(), frontendStages: { prompt: clone(promptStage), settings: clone(settingsStage) }, transformed, usage: null, status: 'pending' };
+        const record = { id: makeId(), model: raw.model || 'unknown', ...requestBinding, provider: raw.chat_completion_source || 'unknown', interfaceType, ...purpose, observationLevel: 'frontend', observationNotice: '仅观察到前端请求；酒馆服务端转换与中转内部路由不可见', startedAt: new Date().toISOString(), timestamp: Date.now(), body: sanitizeRequest(outgoing), sources, world: getSnapshot(), frontendStages: { prompt: clone(promptStage), settings: clone(settingsStage) }, transformed, ...(transformMeta.batchResult?{batchResult:clone(transformMeta.batchResult)}:{}), usage: null, status: 'pending' };
         // Consume event stages once. A raw auxiliary request must not inherit a previous main stage.
         promptStage = null; settingsStage = null;
         inFlight++; safeCall(onInFlight, inFlight); safeCall(onRecord, clone(record));

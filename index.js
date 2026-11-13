@@ -4,6 +4,11 @@ import { installSTAdapter } from './adapters/st.js';
 import { createBrowserStateStore } from './adapters/state-store.js';
 import { createObservationStore } from './adapters/observation-store.js';
 import { diagnosticSummary } from './adapters/diagnostic-view.js';
+import { collectCurrentSetup, getSetupInputs } from './adapters/batch-scan.js';
+import { analyzeSetup } from './core/batch-diagnostics.js';
+import { buildBatchPlan } from './adapters/batch-plan.js';
+import { batchSummary } from './adapters/batch-view.js';
+import { runBatchPolicy, EMPTY_BATCH_POLICY, BATCH_ALGORITHM } from './adapters/batch-runner.js';
 import { observationLayer, ledgerRecords, pricesFor, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence } from './adapters/reporting.js';
 import { hasObservedContext, normalizeUISources, worldSummary } from './adapters/ui-data.js';
 import { eligibleSources, localCandidate, transformWithProfile } from './adapters/pipeline.js';
@@ -14,7 +19,7 @@ import { PROVIDER_RULES, hasUnsupportedContent } from './core/providers.js';
 import { createMemoryLedger, appendMemory, renderMemory } from './core/memory.js';
 
 const KEY = 'cache_lens';
-const defaults = { mode: 'diagnose', maxInputTokens: 160000, contextTokens: 200000, outputReserveTokens: 8192, maxTests: 0, maxCost: 0, currency: 'USD', rules: [], prices: {}, state: null, memory: null, relayHistory: [], baselineIds: [] };
+const defaults = { mode: 'diagnose', maxInputTokens: 160000, contextTokens: 200000, outputReserveTokens: 8192, maxTests: 0, maxCost: 0, currency: 'USD', rules: [], prices: {}, state: null, memory: null, relayHistory: [], baselineIds: [], batchFollow:false, batchPolicy:EMPTY_BATCH_POLICY, batchHistory:[], batchRevision:0 };
 const clone = v => structuredClone(v);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const display = v => v === null || v === undefined ? '未知' : typeof v === 'number' ? v.toLocaleString('zh-CN', {maximumFractionDigits: 6}) : String(v);
@@ -24,7 +29,7 @@ const json = v => JSON.stringify(v, null, 2);
 const MAX_RECORDS = 30;
 const MAX_TOTAL_BYTES = 24 * 1024 * 1024;
 
-export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(), host = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings'), adapterFactory = installSTAdapter, storageNamespace = null, storage = globalThis.localStorage, locks = globalThis.navigator?.locks } = {}) {
+export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(), host = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings'), adapterFactory = installSTAdapter, storageNamespace = null, storage = globalThis.localStorage, locks = globalThis.navigator?.locks, setupCollector = async args => collectCurrentSetup(await getSetupInputs(args)) } = {}) {
   if (!context || !host) return null;
   if (document.getElementById('cache-lens-panel')) return null;
   const settings = { ...clone(defaults), ...clone(context.extensionSettings?.[KEY] || {}) };
@@ -34,13 +39,26 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let adapter, store = null, stateReady = false, savedSnapshot = null, capturedBinding = null, pendingAutoRecord = null, lastAutoRecordId = null;
   let actionQueue = Promise.resolve(), disposed = false;
   let observationStore = null, archiveEnabled = false, archiveWrites = Promise.resolve();
+  let batchSetup=null,batchReport=null,batchPlan=null,batchRecordId=null,batchTimer=null,batchDirty=false,batchScanning=false,batchEpoch=0,lastBatchResult=null;
+  const batchListeners=[];
   let committedSettings = clone({...settings,state:opt,memory});
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.2</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.3</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
+  <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
+    <button data-action="batch-scan">扫描当前角色全部配置（免费）</button>
+    <label><input type="checkbox" data-id="batchFollow">自动跟随切卡、预设变化和正常请求重新扫描（免费）</label>
+    <p class="cl-note">一次读取当前绑定的世界书、当前预设和记忆来源，自动汇总问题。扫描不生成剧情，也不调用优化模型。</p>
+    <div data-id="batchSummary" class="cl-diagnostic-summary">点击扫描即可开始，无需逐条找条目或截图。</div>
+    <div class="cl-toolbar"><button data-action="batch-mark-main" hidden>将当前连接的未归类请求标为正文</button><button data-action="batch-enable">启用跨角色安全排序</button><button data-action="batch-rollback">恢复上一批量设置</button><button data-action="batch-export">导出设置报告（无正文）</button><button data-action="batch-agent">让 Agent 复核报告（按预算计费）</button></div>
+    <p class="cl-note">启用排序表示一次授权：在当前正文接口与模型下，后续角色逐请求检查已激活的完整世界书片段，仅在同一消息、同一作用范围内将合格的常驻资料前置。原书触发与排序字段保持原值。结构校验不证明剧情语义或真实节省；没有可用方案或输入上界无法通过时自动跳过。</p>
+    <div data-id="batchPolicy" class="cl-status"></div><div data-id="batchAgent" class="cl-note"></div>
+    <details><summary>本次排序前后（仅本机，不含正文）</summary><pre data-id="batchPreview"></pre></details>
+    <details><summary>批量设置报告（含条目名称，不含正文）</summary><pre data-id="batchDetails"></pre></details>
+  </details>
   <div class="cl-grid">
     <label>运行模式<select data-id="mode"><option value="diagnose">只诊断</option><option value="preview">预览后应用</option><option value="automatic">受约束自动优化</option></select></label>
     <label>单轮输入上限<input data-id="maxInput" type="number" min="1"></label>
@@ -139,6 +157,87 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       try {context.saveSettingsDebounced?.();}catch{status('本机持久化已完成；酒馆设置镜像暂未保存。',true);}
     } catch(error) {restoreCommitted();render();throw error;}
   }
+  const liveContext=()=>globalThis.SillyTavern?.getContext?.()||context;
+  const batchConnection=()=>batchSetup?.binding;
+  function batchCurrentRecord(setup=batchSetup) {
+    const b=setup?.binding;if(!b)return null;
+    return [...records].reverse().find(r=>r.observationLevel==='frontend'&&r.purpose==='main'&&r.status==='complete'&&hasObservedContext(r)&&r.chatId===b.chatId&&r.model===b.model&&r.provider===b.provider&&!r.imported&&!r.synthetic)||null;
+  }
+  function renderBatch() {
+    $(root,'[data-id="batchFollow"]').checked=settings.batchFollow===true;
+    out('batchSummary',batchReport?batchSummary(batchReport,batchPlan):'点击扫描即可读取当前绑定的全部设置，无需逐条找条目或截图。');
+    const p=settings.batchPolicy;
+    out('batchPolicy',p?.enabled?`批量策略 v${p.version} 已启用：${p.connection?.provider} / ${p.connection?.model}。当前模式：${settings.mode==='diagnose'?'只诊断，排序暂停':'允许已校验请求副本排序'}。${lastBatchResult?'\n最近一次检查：'+lastBatchResult.reason:''}`:'批量排序未启用；当前只读扫描不会修改剧情输入。');
+    const b=batchConnection();
+    $(root,'[data-action="batch-mark-main"]').hidden=!b||b.provider==='unknown'||b.model==='unknown'||!records.some(r=>r.observationLevel==='frontend'&&r.chatId===b.chatId&&r.provider===b.provider&&r.model===b.model&&r.purpose==='unknown');
+    const names=new Map((batchPlan?.profile?.blocks||[]).map(block=>[block.id,String(block.source?.name||block.id).slice(0,80)]));
+    out('batchPreview',batchPlan?.groups?.length?batchPlan.groups.map((group,i)=>`第 ${i+1} 组（${group.role} / ${group.scope}）\n原顺序：${group.before.map(id=>names.get(id)||id).join(' → ')}\n新顺序：${group.after.map(id=>names.get(id)||id).join(' → ')}`).join('\n\n').slice(0,12000)+'\n\n正文增删：0；原书设置修改：0。仅为离线候选，是否允许应用见上方校验结果。':'没有待预览的合格排序范围。');
+  }
+  async function readBatchSetup() {return setupCollector({context:liveContext(),snapshot:adapter?.getSnapshot?.(),getContext:liveContext});}
+  async function scanBatch({follow=false}={}) {
+    assertIdle();batchScanning=true;batchDirty=false;const scanEpoch=batchEpoch;
+    out('batchSummary','正在读取当前绑定的世界书、预设和扩展来源；不会生成模型请求。');
+    try {
+      const setup=await readBatchSetup();assertIdle();if(disposed||scanEpoch!==batchEpoch)return null;
+      const report=analyzeSetup(setup,{records,limits:limits()});
+      const r=batchCurrentRecord(setup);
+      const candidate=buildBatchPlan({record:r,setup:{...setup,batchAuthorized:true},limits:limits()});
+      batchSetup=setup;batchReport=report;batchPlan=candidate;batchRecordId=r?.id??null;
+      out('batchDetails',report);out('batchAgent','');
+      if(follow&&!settings.batchFollow){settings.batchFollow=true;await persist();}
+      renderBatch();return report;
+    } finally {batchScanning=false;if(batchDirty)queueBatchScan();}
+  }
+  function queueBatchScan({invalidate=false}={}) {
+    if(invalidate){batchEpoch++;batchSetup=null;batchReport=null;batchPlan=null;batchRecordId=null;out('batchDetails','配置或角色已改变，旧报告已失效。');renderBatch();}
+    if(disposed||settings.batchFollow!==true)return;
+    batchDirty=true;clearTimeout(batchTimer);
+    batchTimer=setTimeout(()=>{
+      if(disposed||!batchDirty||batchScanning||inFlight||busy||adapter?.getSnapshot?.().generation)return;
+      actionQueue=actionQueue.then(async()=>{await ready;if(disposed||!batchDirty||batchScanning||inFlight||busy||adapter?.getSnapshot?.().generation)return;await scanBatch();}).catch(()=>out('batchSummary','自动扫描暂未完成。请求结束后会重试，或点击扫描；不会重发模型请求。'));
+    },600);
+  }
+  function batchSettingsSnapshot() {return {policy:clone(settings.batchPolicy||EMPTY_BATCH_POLICY),mode:settings.mode,baselineIds:clone(settings.baselineIds||[]),follow:settings.batchFollow===true};}
+  async function enableBatch() {
+    assertIdle();assertFresh();
+    if(!batchSetup||!batchReport)throw new Error('先点击免费扫描，生成当前配置的具体报告。');
+    if(opt.undoStack?.length)throw new Error('当前还有已应用的手动优化副本，请先恢复优化前，避免两种排序叠加。');
+    if(!batchReport.safety?.canPrepareCandidate||!batchPlan?.canApply)throw new Error(batchPlan?.reasons?.join('；')||'当前没有通过校验的排序方案；报告中的问题仍可查看，不能强行应用。');
+    const revision=batchSetup.revision?.fingerprint,recordId=batchRecordId;
+    const fresh=await readBatchSetup();assertIdle();assertFresh();
+    if(!revision||fresh.revision?.fingerprint!==revision||batchCurrentRecord(fresh)?.id!==recordId)throw new Error('角色、配置或请求已改变，请重新扫描；未覆盖任何设置。');
+    const checked=buildBatchPlan({record:batchCurrentRecord(fresh),setup:{...fresh,batchAuthorized:true},limits:limits()});
+    if(!checked.canApply)throw new Error(checked.reasons.join('；')||'新的校验未通过，保持原请求。');
+    const before=batchSettingsSnapshot();
+    settings.batchRevision=(settings.batchRevision||0)+1;
+    settings.batchPolicy={enabled:true,version:settings.batchRevision,algorithm:BATCH_ALGORITHM,connection:{provider:fresh.binding.provider,model:fresh.binding.model}};
+    if(settings.mode==='diagnose')settings.mode='preview';
+    settings.batchFollow=true;settings.baselineIds=billingRecords.map(r=>r.id);
+    settings.batchHistory=[...(settings.batchHistory||[]),{at:new Date().toISOString(),revision:settings.batchRevision,before,after:batchSettingsSnapshot(),reason:'用户一次授权当前正文连接下的跨角色激活片段排序',expectedImpact:{addedEntries:0,removedEntries:0,nativeSettingsChanged:false,actualSavingsKnown:false},rollback:false}].slice(-12);
+    await persist();syncBoundaryInputs();render();status('已启用跨角色安全排序。以后只检查每次请求自身的激活内容；无需逐条勾选，实际效果随正常游玩观察。');
+  }
+  async function rollbackBatch() {
+    assertIdle();assertFresh();const tx=[...(settings.batchHistory||[])].reverse().find(t=>!t.rollback);
+    if(!tx)throw new Error('没有待恢复的批量设置。');
+    const currentPolicy=settings.batchPolicy||EMPTY_BATCH_POLICY;
+    if(currentPolicy.algorithm!==tx.after.policy.algorithm||currentPolicy.enabled!==tx.after.policy.enabled||stableStringify(currentPolicy.connection)!==stableStringify(tx.after.policy.connection)||settings.mode!==tx.after.mode||stableStringify(settings.baselineIds||[])!==stableStringify(tx.after.baselineIds)||!!settings.batchFollow!==!!tx.after.follow)throw new Error('批量策略或关联模式、基线、跟随设置已改变，未强行覆盖。可使用“恢复优化前”停用全部优化。');
+    settings.batchRevision=(settings.batchRevision||0)+1;settings.batchPolicy={...clone(tx.before.policy),version:settings.batchRevision};settings.mode=tx.before.mode;settings.baselineIds=clone(tx.before.baselineIds);settings.batchFollow=tx.before.follow===true;
+    tx.rollback=true;tx.rolledBackAt=new Date().toISOString();await persist();if(!settings.batchFollow){clearTimeout(batchTimer);batchDirty=false;}syncBoundaryInputs();render();status('已恢复上一批量设置；后续请求使用恢复后的策略，原世界书与预设未被改写。');
+  }
+  async function reviewBatchWithAgent() {
+    assertIdle();assertFresh();if(!batchReport)throw new Error('先免费扫描当前配置。');
+    if(settings.maxTests<1||settings.maxCost<=0)throw new Error('未配置额外付费预算，不调用 Agent。');
+    const profile=createProfile({mode:'preview',limits:limits()});
+    const request={diagnostics:{batch:batchReport.agentDigest},proposalContext:{expectedVersion:profile.version,blocks:[],allowedOperations:[],instruction:'Review the diagnostic metadata in reason; return operations: []. No modifications are authorized by this review.'}};
+    busy=true;
+    try {
+      serverStatus=await api('status');const cfg=agentConfigWithBudget(serverStatus.config,settings);if(cfg)await api('agent-config',cfg);
+      const result=await api('agent',request);if(result.record)addRecord(agentObservation(result.record));
+      const proposed=acceptedAgentProposal(result.proposal,profile.version);
+      if(proposed.operations.length)throw new Error('本次只授权 Agent 复核报告，已阻止其修改操作。');
+      out('batchAgent','Agent 复核意见（已计入 Agent 费用，不能当成服务端缓存证据）：\n'+String(proposed.reason||'未提出额外意见。'));
+    } finally {busy=false;}
+  }
   async function initializeStore() {
     try {
       const namespace=storageNamespace ?? (await import('/scripts/user.js')).getCurrentUserHandle();
@@ -159,7 +258,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       if(!saved?.state?.profile || !saved?.memory)throw new Error('持久化优化状态格式无效；已禁止自动覆盖。');
       committedSettings=clone(saved);savedSnapshot=stableStringify(saved);restoreCommitted();
       context.extensionSettings[KEY]=clone(saved);externalSnapshot=stableStringify(saved);stateReady=true;
-      set('prices',json(settings.prices));render();status(settings.pendingRelayIntent?'存在未完成的 relay 事务，请打开断点面板恢复；当前不会自动修改策略。':'被动观察已开启；优化副本和回滚记录已持久化。',!!settings.pendingRelayIntent);
+      set('prices',json(settings.prices));render();status(settings.pendingRelayIntent?'存在未完成的 relay 事务，请打开断点面板恢复；当前不会自动修改策略。':'被动观察已开启；优化副本和回滚记录已持久化。',!!settings.pendingRelayIntent);queueBatchScan();
     }catch(error){stateReady=false;status(error.message+' 仍可只读观察请求。',true);}
   }
   function current() { return records.find(r=>r.id===selectedId) || [...records].reverse().find(r=>layerOf(r)===value('layer')); }
@@ -196,11 +295,12 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     const i=records.findIndex(r=>r.id===next.id);if(i>=0)records[i]=next;else records.push(next);
     while(records.length>MAX_RECORDS || (records.length>1&&JSON.stringify(records).length>MAX_TOTAL_BYTES)) records.shift();
     if(!selectedId || !records.some(r=>r.id===selectedId)) selectedId=next.id;
-    const billed={id:next.id,model:next.model,provider:next.provider,interfaceType:next.interfaceType,purpose:next.purpose,manualPurpose:next.manualPurpose,observationLevel:next.observationLevel,imported:next.imported,usage:next.usage,prices:next.prices,platformBill:next.platformBill,latencyMs:next.latencyMs,status:next.status,reportedStatus:next.reportedStatus,completion:next.completion,transmission:next.transmission,startedAt:next.startedAt||next.time,synthetic:next.synthetic,transformed:next.transformed,diagnostic:next.diagnostic};
+    const billed={id:next.id,model:next.model,provider:next.provider,interfaceType:next.interfaceType,purpose:next.purpose,manualPurpose:next.manualPurpose,observationLevel:next.observationLevel,imported:next.imported,usage:next.usage,prices:next.prices,platformBill:next.platformBill,latencyMs:next.latencyMs,status:next.status,reportedStatus:next.reportedStatus,completion:next.completion,transmission:next.transmission,startedAt:next.startedAt||next.time,synthetic:next.synthetic,transformed:next.transformed,batchResult:next.batchResult,diagnostic:next.diagnostic};
     billed.synthetic=!!(next.synthetic||next.replay||next.predicted||next.evidence==='offline-preview');
     const bi=billingRecords.findIndex(r=>r.id===billed.id);if(bi>=0)billingRecords[bi]=billed;else if(billingRecords.length<10000)billingRecords.push(billed);else status('用量记录达到 10000 条上限；请导出并开始新观察会话。当前累计不再完整。',true);
     saveObservations([billed]);render();
     if(next.status==='complete'&&next.purpose==='main'&&next.observationLevel==='frontend'){pendingAutoRecord=next;scheduleAutomatic();}
+    if(next.status==='complete'&&next.purpose!=='agent')queueBatchScan();
   }
   function render() {
     const layer=value('layer');const list=records.filter(r=>layerOf(r)===layer);
@@ -219,7 +319,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       out('world',worldSummary(r,{maxInputTokens:settings.maxInputTokens}));
     } else {out('differenceSummary','等待正常请求，或导入已有脱敏诊断。');out('difference','等待正常请求，或导入脱敏 JSON。');out('request','');$(root,'[data-id="facts"]').textContent='仅观察到前端请求（尚无完整服务端记录）';}
     out('history',{version:opt.profile.version,mode:settings.mode,blocks:opt.profile.blocks.length,transactions:opt.history.map(t=>({id:t.id,at:t.at,reason:t.reason,impact:t.impact,rollback:t.rollback}))});
-    out('rules',settings.rules);out('memory',renderMemory(memory));
+    out('rules',settings.rules);out('memory',renderMemory(memory));renderBatch();
   }
   function download(name, content) { const url=URL.createObjectURL(new Blob([json(content)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000); }
   async function api(path,body) { const headers=context.getRequestHeaders?.()||{'Content-Type':'application/json'};const r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body)});if(!r.ok){let code='';try{const data=await r.json();if(/^[A-Z0-9_]{1,100}$/.test(data.error))code=data.error;}catch{}const error=new Error(agentSetupError(code,r.status));error.code=code;error.httpStatus=r.status;throw error;}return r.json(); }
@@ -278,6 +378,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   function doPreview(record=current()) {draft=JSON.parse(value('proposal'));preview=previewProposal(opt.profile,draft,localContext(record));lastPreviewState=stableStringify(opt);out('preview',preview.ok?{ok:true,evidence:preview.evidence,impact:preview.impact,before:preview.before.blocks.map(b=>b.id),after:preview.after.blocks.map(b=>b.id),reason:draft.reason}:preview);return preview;}
   async function doApply(record=current()) {
     assertIdle();assertFresh();if(settings.mode==='diagnose')throw new Error('只诊断模式不可应用修改。');
+    if(settings.batchPolicy?.enabled)throw new Error('跨角色批量排序已启用，请先恢复批量设置再应用手动方案，避免两种策略互相覆盖。');
     if(lastPreviewState!==stableStringify(opt))throw new Error('副本已变化，请重新预览。');
     opt=applyProposal(opt,JSON.parse(value('proposal')),{...localContext(record),expectedPreview:preview});
     await persist();render();status('已应用优化副本；等待下一次正常请求验证。');
@@ -287,7 +388,8 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     assertIdle();assertFresh();
     if(restore)await rollbackRelayAll();
     if(restore&&opt.undoStack?.length)opt=rollback(opt,{all:true,inFlight:false,expectedVersion:opt.profile.version,expectedProfile:opt.profile});
-    settings.mode='diagnose';await persist();set('mode','diagnose');render();
+    if(restore){const first=(settings.batchHistory||[]).find(tx=>!tx.rollback);if(first){settings.batchFollow=first.before.follow===true;settings.baselineIds=clone(first.before.baselineIds);}settings.batchRevision=(settings.batchRevision||0)+1;settings.batchPolicy={...clone(EMPTY_BATCH_POLICY),version:settings.batchRevision};for(const tx of settings.batchHistory||[])tx.rollback=true;}
+    settings.mode='diagnose';await persist();if(!settings.batchFollow){clearTimeout(batchTimer);batchDirty=false;}set('mode','diagnose');render();
     status(restore?'已恢复优化前副本并停用优化。':'已停用自动优化；原始请求继续正常发送。');
   }
   function matchesBinding(record) {
@@ -295,7 +397,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     return !!binding&&['chatId','model','provider','purpose'].every(key=>binding[key]===record?.[key]);
   }
   function scheduleAutomatic() {
-    if(disposed||!stateReady||settings.pendingRelayIntent||settings.mode!=='automatic'||!pendingAutoRecord||pendingAutoRecord.id===lastAutoRecordId||inFlight||busy||adapter?.getSnapshot?.().generation)return;
+    if(disposed||!stateReady||settings.batchPolicy?.enabled||settings.pendingRelayIntent||settings.mode!=='automatic'||!pendingAutoRecord||pendingAutoRecord.id===lastAutoRecordId||inFlight||busy||adapter?.getSnapshot?.().generation)return;
     const record=pendingAutoRecord;
     actionQueue=actionQueue.then(async()=>{
       if(disposed||settings.mode!=='automatic'||inFlight||busy||adapter?.getSnapshot?.().generation||!records.some(r=>r.id===record.id)||pendingAutoRecord?.id!==record.id)return;
@@ -307,6 +409,17 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     }).catch(error=>status(error.message,true));
   }
   const actions = {
+    async 'batch-scan'(){await scanBatch({follow:true});},
+    'batch-enable':enableBatch,
+    'batch-rollback':rollbackBatch,
+    'batch-agent':reviewBatchWithAgent,
+    'batch-export'(){if(!batchReport)throw new Error('先免费扫描当前配置。');download('cache-lens-settings-report.json',{...batchReport,notice:'包含世界书/条目名称与设置，不含提示词正文、触发词文本或密钥。仅为本地诊断，不能证明实际节省。'});},
+    async 'batch-mark-main'(){
+      assertIdle();assertFresh();const b=batchConnection();if(!b||[b.provider,b.model].some(x=>!x||x==='unknown'))throw new Error('先扫描有效的当前连接。');
+      settings.rules=[...settings.rules.filter(r=>!(r.provider===b.provider&&r.model===b.model)),{provider:b.provider,model:b.model,purpose:'main'}];
+      for(const r of [...records,...billingRecords])if(r.provider===b.provider&&r.model===b.model&&r.purpose==='unknown'){r.purpose='main';r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;}
+      await persist();saveObservations();await scanBatch();render();
+    },
     async save(){assertIdle();assertFresh();const proposed={};for(const [key,id]of [['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost']]){const n=Number(value(id));if(!Number.isFinite(n)||n<0||(key!=='maxCost'&&!Number.isSafeInteger(n)))throw new Error('tokens 和次数上限必须是非负整数，费用须是非负数字');proposed[key]=n;}if(proposed.maxInputTokens<1||proposed.contextTokens<=proposed.outputReserveTokens)throw new Error('输入和上下文边界无效');if(!['diagnose','preview','automatic'].includes(value('mode')))throw new Error('未知运行模式');Object.assign(settings,proposed,{mode:value('mode')});await persist();syncBoundaryInputs();status('已保存边界；自动模式在下一次正常正文完成后，只在已授权副本范围内生成免费本地排序方案。');render();scheduleAutomatic();},
     async 'add-rule'(){const provider=value('ruleProvider').trim(),model=value('ruleModel').trim();if(!provider||!model)throw new Error('需要接口来源和完整模型 ID');settings.rules=settings.rules.filter(r=>!(r.provider===provider&&r.model===model));settings.rules.push({provider,model,purpose:value('rulePurpose')});for(const r of [...records,...billingRecords])if(r.provider===provider&&r.model===model){r.purpose=value('rulePurpose');r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;}await persist();saveObservations();render();},
     async 'save-prices'(){settings.prices=validatePriceTable(JSON.parse(value('prices')));await persist();render();},
@@ -326,7 +439,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     async candidate(){draft=localCandidate(opt.profile);if(!draft.operations.length){out('preview','当前已授权片段没有可执行的排序改进；未修改、未付费。');return;}set('proposal',json(draft));doPreview();if(settings.mode==='automatic'&&preview.ok)await doApply();},
     preview:doPreview,
     apply:doApply,
-    async rollback(){const latest=settings.relayHistory.at(-1);if(latest&&(!opt.undoStack?.length||latest.at>(opt.history.at(-1)?.at||'')))await rollbackOneRelay(latest);else await doRollback(false);},
+    async rollback(){const latest=settings.relayHistory.at(-1),batch=[...(settings.batchHistory||[])].reverse().find(t=>!t.rollback);if(batch&&batch.at>(latest?.at||'')&&batch.at>(opt.history.at(-1)?.at||''))await rollbackBatch();else if(latest&&(!opt.undoStack?.length||latest.at>(opt.history.at(-1)?.at||'')))await rollbackOneRelay(latest);else await doRollback(false);},
     async restore(){await stopAutomatic({restore:true});},
     async agent(){
       assertIdle();if(settings.maxTests<1||settings.maxCost<=0)throw new Error('未配置额外付费预算，不调用 Agent。');busy=true;
@@ -388,23 +501,30 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   $(root,'[data-id="layer"]').addEventListener('change',()=>{selectedId=null;render();});
   $(root,'[data-id="record"]').addEventListener('change',event=>{selectedId=event.target.value;render();});
   $(root,'[data-id="purpose"]').addEventListener('change',event=>{const r=current();if(r){r.purpose=event.target.value;r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;const bill=billingRecords.find(b=>b.id===r.id);if(bill){bill.purpose=r.purpose;bill.manualPurpose=true;}saveObservations();render();}});
+  $(root,'[data-id="batchFollow"]').addEventListener('change',event=>{const enabled=event.target.checked;actionQueue=actionQueue.then(async()=>{await ready;assertIdle();settings.batchFollow=enabled;await persist();if(enabled)queueBatchScan();else{clearTimeout(batchTimer);batchDirty=false;}renderBatch();}).catch(error=>status(error.message,true));});
   $(root,'[data-id="file"]').addEventListener('change',async event=>{try{const file=event.target.files[0];if(!file)return;if(file.size>16*1024*1024)throw new Error('导入文件超过 16MB');const data=JSON.parse(await file.text());for(const record of importEvidence(data))addRecord(record);set('layer','import');render();}catch(e){status(e.message,true);}finally{event.target.value='';}});
   for(const [key,id]of [['mode','mode'],['maxInputTokens','maxInput'],['contextTokens','context'],['outputReserveTokens','reserve'],['maxTests','maxTests'],['maxCost','maxCost'],['maxTests','agentCalls'],['maxCost','agentCost'],['currency','currency']])set(id,settings[key]);
   set('prices',json(settings.prices));set('agentPriceDate',new Date().toISOString().slice(0,10));
   $(root,'[data-id="book"]').innerHTML=(context.getWorldInfoNames?.()||[]).map(n=>`<option>${esc(n)}</option>`).join('');
-  adapter=adapterFactory({getContext:()=>globalThis.SillyTavern?.getContext?.()||context,onRecord:addRecord,onSources:(s,w)=>{sources=s;world=w;scheduleAutomatic();},onInFlight:n=>{inFlight=n;status(n?`正在观察 ${n} 个请求；修改锁定。`:'被动观察中；不会额外发送正文测试。');if(!n)scheduleAutomatic();},onError:e=>status(e,true),resolvePurpose:body=>committedSettings.rules.find(r=>r.provider===body.chat_completion_source&&r.model===body.model)?.purpose,transform:(body,meta)=>{
+  adapter=adapterFactory({getContext:()=>globalThis.SillyTavern?.getContext?.()||context,onRecord:addRecord,onSources:(s,w)=>{sources=s;world=w;scheduleAutomatic();if(batchDirty)queueBatchScan();},onInFlight:n=>{inFlight=n;status(n?`正在观察 ${n} 个请求；修改锁定。`:'被动观察中；不会额外发送正文测试。');if(!n){scheduleAutomatic();if(batchDirty)queueBatchScan();}},onError:e=>status(e,true),resolvePurpose:body=>committedSettings.rules.find(r=>r.provider===body.chat_completion_source&&r.model===body.model)?.purpose,transform:(body,meta)=>{
     if(!stateReady||committedSettings.pendingRelayIntent||committedSettings.mode==='diagnose'||!store.matches(savedSnapshot))return body;
-    const currentState=context.extensionSettings?.[KEY]?.state;
-    if(currentState&&stableStringify(currentState)!==stableStringify(settings.state))return body;
+    if(stableStringify(context.extensionSettings?.[KEY]??null)!==externalSnapshot)return body;
+    if(committedSettings.batchPolicy?.enabled){
+      const run=runBatchPolicy(body,meta,committedSettings.batchPolicy,{maxInputTokens:committedSettings.maxInputTokens,contextTokens:committedSettings.contextTokens,outputReserveTokens:committedSettings.outputReserveTokens});
+      meta.batchResult=run.result;lastBatchResult=run.result;renderBatch();return run.body;
+    }
     const ceiling=Math.min(committedSettings.maxInputTokens,committedSettings.contextTokens-committedSettings.outputReserveTokens);
     if(new TextEncoder().encode(JSON.stringify(body)).length+4096>ceiling||hasUnsupportedContent(body))return body;
     return transformWithProfile(body,committedSettings.state.profile,{binding:meta});
   },validateTransform:()=>true});
+  for(const name of ['CHAT_CHANGED','OAI_PRESET_CHANGED_AFTER','WORLDINFO_SETTINGS_UPDATED','CHARACTER_EDITED']){
+    const event=context.eventTypes?.[name];if(event&&context.eventSource?.on){const callback=()=>queueBatchScan({invalidate:true});context.eventSource.on(event,callback);batchListeners.push([event,callback]);}
+  }
   const timer=setInterval(()=>{if(serverStatus?.observerConfigured&&!inFlight&&!busy)refresh().catch(()=>{});},15000);
   render();status('被动观察已开启，正在载入持久化优化状态。');
   const ready=initializeStore();
   // Read-only publicly documented adapter surface, never accepts executable Agent tools.
-  const publicAPI={ready,flushObservations:()=>archiveWrites,getMemory:()=>clone(memory),getDiagnostics:()=>compactDiagnostic(diagnostic()),getRecords:()=>clone(records),adapter,dispose(){disposed=true;clearInterval(timer);adapter.dispose();root.remove();}};
+  const publicAPI={ready,flushObservations:()=>archiveWrites,getMemory:()=>clone(memory),getDiagnostics:()=>compactDiagnostic(diagnostic()),getBatchReport:()=>clone(batchReport),getRecords:()=>clone(records),adapter,dispose(){disposed=true;clearInterval(timer);clearTimeout(batchTimer);for(const [event,callback]of batchListeners)(context.eventSource.removeListener||context.eventSource.off)?.call(context.eventSource,event,callback);adapter.dispose();root.remove();}};
   return publicAPI;
 }
 

@@ -9,6 +9,8 @@ import { analyzeSetup } from './core/batch-diagnostics.js';
 import { buildBatchPlan } from './adapters/batch-plan.js';
 import { batchSummary } from './adapters/batch-view.js';
 import { summarizeBatchPlan, formatPlanRejections } from './adapters/batch-plan-report.js';
+import { createAuditPacket, runAgentAudit } from './adapters/agent-audit.js';
+import { auditBudget } from './adapters/agent-audit-budget.js';
 import { runBatchPolicy, EMPTY_BATCH_POLICY, BATCH_ALGORITHM } from './adapters/batch-runner.js';
 import { observationLayer, ledgerRecords, pricesFor, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence } from './adapters/reporting.js';
 import { hasObservedContext, normalizeUISources, worldSummary } from './adapters/ui-data.js';
@@ -41,12 +43,13 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let actionQueue = Promise.resolve(), disposed = false;
   let observationStore = null, archiveEnabled = false, archiveWrites = Promise.resolve();
   let batchSetup=null,batchReport=null,batchPlan=null,batchRecordId=null,batchTimer=null,batchDirty=false,batchScanning=false,batchEpoch=0,lastBatchResult=null;
+  let auditController=null,auditResult=null,auditSelection=null;
   const batchListeners=[];
   let committedSettings = clone({...settings,state:opt,memory});
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.5</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.6</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
@@ -55,7 +58,14 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     <p class="cl-note">一次读取当前绑定的世界书、当前预设和记忆来源，自动汇总问题。扫描不生成剧情，也不调用优化模型。</p>
     <div data-id="batchSummary" class="cl-diagnostic-summary">点击扫描即可开始，无需逐条找条目或截图。</div>
     <div data-id="batchBlockers" class="cl-note"></div>
-    <div class="cl-toolbar"><button data-action="batch-mark-main" hidden>将当前连接的未归类请求标为正文</button><button data-action="batch-enable">启用跨角色安全排序</button><button data-action="batch-rollback">恢复上一批量设置</button><button data-action="batch-export">导出设置报告（无正文）</button><button data-action="batch-agent">让 Agent 复核报告（按预算计费）</button></div>
+    <div class="cl-toolbar"><button data-action="batch-mark-main" hidden>将当前连接的未归类请求标为正文</button><button data-action="batch-enable">启用跨角色安全排序</button><button data-action="batch-rollback">恢复上一批量设置</button><button data-action="batch-export">导出设置报告（无正文）</button></div>
+    <details open><summary>Agent 全面检查 · 当前角色配置</summary>
+      <p class="cl-note">自动重新采集全部绑定世界书、当前预设、公开扩展来源和已有请求，分批交给你配置的 Agent 检查，最后汇总方案。默认只发送设置和诊断元数据，不上传整本世界书；不扫描其他未绑定角色或未知插件内部文件。</p>
+      <label><input type="checkbox" data-id="auditExcerpts">允许发送问题附近的局部正文（最多 10 段，每段 600 字符；可能包含角色名称和剧情）</label>
+      <div class="cl-toolbar"><button data-action="audit-setup">设置 Agent 地址、模型与预算</button><button data-action="batch-agent">Agent 全面检查当前配置</button><button data-action="audit-stop" disabled>停止后续 Agent 调用</button><button data-action="audit-apply" hidden>预览并应用 Agent 方案</button><button data-action="audit-export" hidden>导出 Agent 检查结果</button></div>
+      <div data-id="auditProgress" class="cl-status" role="status">先完成本机采集和预算核对，预算不足时不会调用模型。无需为检查额外发送剧情。</div>
+      <pre data-id="auditResult" class="cl-note"></pre>
+    </details>
     <p class="cl-note">启用排序表示一次授权：在当前正文接口与模型下，后续角色逐请求检查已激活的完整世界书片段，仅在同一消息、同一作用范围内将合格的常驻资料前置。原书触发与排序字段保持原值。结构校验不证明剧情语义或真实节省；没有可用方案或输入上界无法通过时自动跳过。</p>
     <div data-id="batchPolicy" class="cl-status"></div><div data-id="batchAgent" class="cl-note"></div>
     <details><summary>本次排序前后（仅本机，不含正文）</summary><pre data-id="batchPreview"></pre></details>
@@ -177,12 +187,12 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     out('batchPreview',batchPlan?.groups?.length?batchPlan.groups.map((group,i)=>`第 ${i+1} 组（${group.role} / ${group.scope}）\n原顺序：${group.before.map(id=>names.get(id)||id).join(' → ')}\n新顺序：${group.after.map(id=>names.get(id)||id).join(' → ')}`).join('\n\n').slice(0,12000)+'\n\n正文增删：0；原书设置修改：0。仅为离线候选，是否允许应用见上方校验结果。':'没有待预览的合格排序范围。');
   }
   async function readBatchSetup() {return setupCollector({context:liveContext(),snapshot:adapter?.getSnapshot?.(),getContext:liveContext});}
-  async function scanBatch({follow=false}={}) {
+  async function scanBatch({follow=false,audit=false}={}) {
     assertIdle();batchScanning=true;batchDirty=false;const scanEpoch=batchEpoch;
     out('batchSummary','正在读取当前绑定的世界书、预设和扩展来源；不会生成模型请求。');
     try {
       const setup=await readBatchSetup();assertIdle();if(disposed||scanEpoch!==batchEpoch)return null;
-      const report=analyzeSetup(setup,{records,limits:limits()});
+      const report=analyzeSetup(setup,{records:records.filter(r=>r.purpose!=='agent'),limits:{...limits(),...(audit?{maxAnalysisRecords:100,maxAnalysisSourcesPerRecord:2000}:{})}});
       const r=batchCurrentRecord(setup);
       const candidate=buildBatchPlan({record:r,setup:{...setup,batchAuthorized:true},limits:limits()});
       const requestRef=report.requestGroups.flatMap(group=>group.requests).find(item=>item.id===r?.id)?.ref;
@@ -194,7 +204,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     } finally {batchScanning=false;if(batchDirty)queueBatchScan();}
   }
   function queueBatchScan({invalidate=false}={}) {
-    if(invalidate){batchEpoch++;batchSetup=null;batchReport=null;batchPlan=null;batchRecordId=null;out('batchDetails','配置或角色已改变，旧报告已失效。');renderBatch();}
+    if(invalidate){auditController?.abort();auditSelection=null;$(root,'[data-action="audit-apply"]').hidden=true;batchEpoch++;batchSetup=null;batchReport=null;batchPlan=null;batchRecordId=null;out('batchDetails','配置或角色已改变，旧报告已失效。');renderBatch();}
     if(disposed||settings.batchFollow!==true)return;
     batchDirty=true;clearTimeout(batchTimer);
     batchTimer=setTimeout(()=>{
@@ -230,18 +240,49 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     tx.rollback=true;tx.rolledBackAt=new Date().toISOString();await persist();if(!settings.batchFollow){clearTimeout(batchTimer);batchDirty=false;}syncBoundaryInputs();render();status('已恢复上一批量设置；后续请求使用恢复后的策略，原世界书与预设未被改写。');
   }
   async function reviewBatchWithAgent() {
-    assertIdle();assertFresh();if(!batchReport)throw new Error('先免费扫描当前配置。');
-    if(settings.maxTests<1||settings.maxCost<=0)throw new Error('未配置额外付费预算，不调用 Agent。');
-    const profile=createProfile({mode:'preview',limits:limits()});
-    const request={diagnostics:{batch:batchReport.agentDigest},proposalContext:{expectedVersion:profile.version,blocks:[],allowedOperations:[],instruction:'Review the diagnostic metadata in reason; return operations: []. No modifications are authorized by this review.'}};
-    busy=true;
+    assertIdle();assertFresh();auditSelection=null;auditResult=null;
+    $(root,'[data-action="audit-apply"]').hidden=true;$(root,'[data-action="audit-export"]').hidden=true;
+    out('auditResult','');out('auditProgress','正在本机采集全部绑定配置并核对覆盖范围……');
+    const report=await scanBatch({audit:true});if(!report)throw new Error('采集期间配置已变化，请稍后再运行。');
+    const packet=createAuditPacket(report,{plan:batchPlan,limits:limits(),setup:batchSetup,records,shareExcerpts:$(root,'[data-id="auditExcerpts"]').checked});
+    out('auditProgress',`已本机读取 ${report.counts.entries} 条世界书、${report.counts.presetPrompts} 项预设、${report.counts.extensionSources} 个扩展来源。Agent 将分 ${packet.pages.length} 批检查，再统一汇总，共需 ${packet.requiredCalls} 次调用。`);
+    if(packet.tooManyPages)throw new Error('当前配置超过单次 Agent 检查的 24 批上限；已保留本机报告，尚未调用模型。');
+    if(settings.maxTests<1||settings.maxCost<=0)throw new Error('未配置 Agent 付费预算；本机采集已完成，请在下方 Agent 设置保存预算后再点击。');
+    const epoch=batchEpoch,revision=batchSetup.revision?.fingerprint,recordId=batchRecordId,snapshot=savedSnapshot,share=$(root,'[data-id="auditExcerpts"]').checked;
+    const controller=new AbortController();auditController=controller;
+    $(root,'[data-action="audit-stop"]').disabled=false;busy=true;
+    const stillCurrent=async()=>{
+      if(disposed||controller.signal.aborted||batchEpoch!==epoch||inFlight||adapter?.getSnapshot?.().generation)return false;
+      try{assertFresh();}catch{return false;}
+      if(savedSnapshot!==snapshot||share!==$(root,'[data-id="auditExcerpts"]').checked)return false;
+      const fresh=await readBatchSetup();
+      if(disposed||controller.signal.aborted||batchEpoch!==epoch||inFlight||adapter?.getSnapshot?.().generation)return false;
+      try{assertFresh();}catch{return false;}
+      return savedSnapshot===snapshot&&share===$(root,'[data-id="auditExcerpts"]').checked&&fresh.revision?.fingerprint===revision&&batchCurrentRecord(fresh)?.id===recordId;
+    };
     try {
-      serverStatus=await api('status');const cfg=agentConfigWithBudget(serverStatus.config,settings);if(cfg)await api('agent-config',cfg);
-      const result=await api('agent',request);if(result.record)addRecord(agentObservation(result.record));
-      const proposed=acceptedAgentProposal(result.proposal,profile.version);
-      if(proposed.operations.length)throw new Error('本次只授权 Agent 复核报告，已阻止其修改操作。');
-      out('batchAgent','Agent 复核意见（已计入 Agent 费用，不能当成服务端缓存证据）：\n'+String(proposed.reason||'未提出额外意见。'));
-    } finally {busy=false;}
+      serverStatus=await api('status');if(!await stillCurrent())throw new Error('检查已停止或配置已改变；尚未调用 Agent。');
+      const budget=auditBudget(packet,serverStatus,settings);out('auditProgress',budget.reason);if(!budget.ok)throw new Error(budget.reason);
+      const result=await runAgentAudit({packet,maxCalls:budget.remainingCalls,signal:controller.signal,canContinue:stillCurrent,
+        onProgress:p=>{if(!disposed)out('auditProgress',`Agent 已检查 ${p.reviewedPages} / ${p.totalPages} 批；已发起 ${p.calls} 次调用。${p.phase==='synthesis'?'正在统一汇总证据与方案。':'可以停止后续调用；正在进行的一次仍可能计费。'}`);},
+        callAgent:async payload=>{const response=await api('agent',payload);if(response.record)addRecord(agentObservation(response.record));return response;}});
+      auditResult={...result,notice:'仅检查当前绑定配置及已观测请求；模型意见不是服务端缓存证据或自动修改授权。',excerptsShared:share};
+      if(!disposed){
+        const reasons={AUDIT_CANCELLED_OR_STALE:'已停止，或配置/请求已改变。',INVALID_AUDIT_RESPONSE:'模型未返回要求的结构化格式，已停止，不会自动重试。',UNAUTHORIZED_AUDIT_OPERATION:'模型提出了越权操作，已阻止。',AUDIT_STOPPED_AFTER_ERROR:'调用失败或状态核验失败，已停止，不会自动重试。',INSUFFICIENT_CALL_BUDGET:'剩余调用次数不足。',AUDIT_SCOPE_REQUIRES_TOO_MANY_CALLS:'当前配置超过单次检查的分页范围。',AUDIT_SYNTHESIS_TOO_LARGE:'汇总超出本次传输上限。'};
+        out('auditProgress',result.status==='complete'?`Agent 检查完成：${result.reviewedPages} / ${result.totalPages} 批；共 ${result.calls} 次调用。${report.coverage.complete?'当前绑定设置元数据已覆盖；不等于全文语义审查。':'本机采集存在缺口，详见报告。'}`:`Agent 检查未完成：${result.reviewedPages} / ${result.totalPages} 批。${reasons[result.reason]||'已停止。'} 已发生调用仍计费。`);
+        out('auditResult',result.synthesis||result.notes?.map((n,i)=>`第 ${i+1} 批：${typeof n==='string'?n:JSON.stringify(n)}`).join('\n\n')||result.reason||'没有可展示的结果。');
+        $(root,'[data-action="audit-export"]').hidden=false;
+        if(result.status==='complete'&&result.selectedCandidateId==='current-batch'&&await stillCurrent()){
+          auditSelection={epoch,revision,recordId};$(root,'[data-action="audit-apply"]').hidden=false;
+          out('batchAgent','Agent 选择了本地已校验的排序候选；下方可查看前后顺序，再点击“预览并应用 Agent 方案”。尚未启用修改。');
+        }else out('batchAgent','本次没有可应用的 Agent 选择。检查意见中的其他建议仍属只读，不能绕过标签、作用域、预算或第三方适配限制。');
+      }
+    } finally {
+      busy=false;if(auditController===controller)auditController=null;
+      if(!disposed){$(root,'[data-action="audit-stop"]').disabled=true;if(batchDirty)queueBatchScan();}
+      // Also recover billed failed calls: the server retains usage or a reservation.
+      if(serverStatus?.configured&&!disposed)try{const data=await api('agent-records');for(const r of data.records||[])addRecord(agentObservation(r));}catch{/* Keep server ledger authoritative when collection is unavailable. */}
+    }
   }
   async function initializeStore() {
     try {
@@ -418,6 +459,13 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     'batch-enable':enableBatch,
     'batch-rollback':rollbackBatch,
     'batch-agent':reviewBatchWithAgent,
+    'audit-setup'(){const section=$(root,'[data-id="agentSection"]');for(let e=section;e&&e!==root;e=e.parentElement)if(e.tagName==='DETAILS')e.open=true;section.scrollIntoView?.({behavior:'smooth',block:'start'});},
+    async 'audit-apply'(){
+      assertIdle();assertFresh();
+      if(!auditSelection||auditSelection.epoch!==batchEpoch||auditSelection.revision!==batchSetup?.revision?.fingerprint||auditSelection.recordId!==batchRecordId||auditResult?.status!=='complete'||auditResult.selectedCandidateId!=='current-batch')throw new Error('Agent 方案已失效或不存在；未应用任何改动。');
+      await enableBatch();auditSelection=null;$(root,'[data-action="audit-apply"]').hidden=true;
+    },
+    'audit-export'(){if(!auditResult)throw new Error('尚无 Agent 检查结果。');download('cache-lens-agent-audit.json',auditResult);},
     'batch-export'(){if(!batchReport)throw new Error('先免费扫描当前配置。');download('cache-lens-settings-report.json',{...batchReport,notice:'包含世界书/条目名称与设置，不含提示词正文、触发词文本或密钥。仅为本地诊断，不能证明实际节省。'});},
     async 'batch-mark-main'(){
       assertIdle();assertFresh();const b=batchConnection();if(!b||[b.provider,b.model].some(x=>!x||x==='unknown'))throw new Error('先扫描有效的当前连接。');
@@ -502,7 +550,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     async 'recover-policy'(){assertIdle();assertFresh();const intent=settings.pendingRelayIntent;if(!intent)throw new Error('没有待恢复事务');const result=await recoverPolicyIntent({intent,...relayCallbacks(intent.observerId)});out('policyStatus',result);if(result.intentPending)throw new Error('恢复尚未完成：'+result.status+'。未覆盖并发修改，请核对 relay 当前策略。');}
 
   };
-  root.addEventListener('click',event=>{const action=event.target.closest('[data-action]')?.dataset.action;if(!action)return;actionQueue=actionQueue.then(async()=>{await ready;await actions[action]?.();}).catch(error=>status(error.message,true));});
+  root.addEventListener('click',event=>{const action=event.target.closest('[data-action]')?.dataset.action;if(!action)return;if(action==='audit-stop'){auditController?.abort();out('auditProgress','已要求停止后续 Agent 调用；正在进行的一次仍可能计费，完成后保留已收到结果。');return;}actionQueue=actionQueue.then(async()=>{await ready;await actions[action]?.();}).catch(error=>status(error.message,true));});
   $(root,'[data-id="layer"]').addEventListener('change',()=>{selectedId=null;render();});
   $(root,'[data-id="record"]').addEventListener('change',event=>{selectedId=event.target.value;render();});
   $(root,'[data-id="purpose"]').addEventListener('change',event=>{const r=current();if(r){r.purpose=event.target.value;r.manualPurpose=true;if(hasObservedContext(r))delete r.diagnostic;const bill=billingRecords.find(b=>b.id===r.id);if(bill){bill.purpose=r.purpose;bill.manualPurpose=true;}saveObservations();render();}});
@@ -529,7 +577,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   render();status('被动观察已开启，正在载入持久化优化状态。');
   const ready=initializeStore();
   // Read-only publicly documented adapter surface, never accepts executable Agent tools.
-  const publicAPI={ready,flushObservations:()=>archiveWrites,getMemory:()=>clone(memory),getDiagnostics:()=>compactDiagnostic(diagnostic()),getBatchReport:()=>clone(batchReport),getRecords:()=>clone(records),adapter,dispose(){disposed=true;clearInterval(timer);clearTimeout(batchTimer);for(const [event,callback]of batchListeners)(context.eventSource.removeListener||context.eventSource.off)?.call(context.eventSource,event,callback);adapter.dispose();root.remove();}};
+  const publicAPI={ready,flushObservations:()=>archiveWrites,getMemory:()=>clone(memory),getDiagnostics:()=>compactDiagnostic(diagnostic()),getBatchReport:()=>clone(batchReport),getAgentAudit:()=>clone(auditResult),getRecords:()=>clone(records),adapter,dispose(){disposed=true;auditController?.abort();clearInterval(timer);clearTimeout(batchTimer);for(const [event,callback]of batchListeners)(context.eventSource.removeListener||context.eventSource.off)?.call(context.eventSource,event,callback);adapter.dispose();root.remove();}};
   return publicAPI;
 }
 

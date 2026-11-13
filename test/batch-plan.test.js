@@ -59,13 +59,43 @@ test('macro, dependent tag, neighbour reference and incomplete provenance fail c
  ]) {const p=plan(record([dynamic,bad]));assert.equal(p.canApply,false);assert.equal(p.counts.selectedEntries,0);}
 });
 
-test('different outer tag scopes or native injection metadata never merged',()=>{
+test('different outer tag scopes or meaningful native injection metadata never merged',()=>{
  const wrapped=record([dynamic,stable],'<first>'+dynamic.text+'</first>\n<second>'+stable.text+'</second>');
  assert.equal(plan(wrapped).canApply,false);
- const different=structuredClone(stable);different.entry.depth=0;
- assert.equal(plan(record([dynamic,different])).canApply,false);
+ const atDepthDynamic=structuredClone(dynamic);atDepthDynamic.entry.position=4;
+ const different=structuredClone(stable);different.entry.position=4;different.entry.depth=0;
+ assert.equal(plan(record([atDepthDynamic,different])).canApply,false);
  const malformed=record([dynamic,stable],'<incomplete>'+dynamic.text+'\n'+stable.text);
  assert.equal(plan(malformed).canApply,false);
+});
+
+test('inactive native editor role and depth cannot split fixed-position siblings',()=>{
+ for(const position of [0,1,2,3,5,6]) {
+  const recalled=source('recalled','<资料>按需召回的人物事实。</资料>',{position,role:0,depth:4});
+  const foundation=source('foundation','<基础>必要的稳定世界事实。</基础>',{constant:true,position,depth:99,outletName:'inactive-outlet'});
+  delete foundation.entry.role;
+  const r=record([recalled,foundation]),before=structuredClone(r),p=plan(r);
+  assert.equal(p.canApply,true,`fixed position ${position}: ${p.reasons.join()}`);
+  assert.equal(p.counts.selectedEntries,2);assert.deepEqual(r,before);
+  assert.equal(p.previewBody.messages[0].role,'system');
+  assert.equal(p.previewBody.messages[0].content,'<world_info>\n'+foundation.text+'\n\u00a0'+recalled.text+'\n</world_info>');
+ }
+});
+
+test('native position, active depth role and outlet distinctions still block grouping',()=>{
+ for(const [a,b] of [
+  [{position:0},{position:1}],
+  [{position:4,depth:4,role:0},{position:4,depth:4,role:1}],
+  [{position:4,depth:4,role:0},{position:4,depth:0,role:0}],
+  [{position:7,outletName:'first'},{position:7,outletName:'second'}],
+  [{position:99,role:0},{position:99,role:1}],
+ ]) {
+  const recalled=source('recalled','<资料>按需召回的人物事实。</资料>',a);
+  const foundation=source('foundation','<基础>必要的稳定世界事实。</基础>',{constant:true,...b});
+  assert.equal(plan(record([recalled,foundation])).canApply,false,JSON.stringify([a,b]));
+ }
+ const r=record();r.body.messages=[{role:'system',content:dynamic.text},{role:'user',content:stable.text}];
+ assert.equal(plan(r).canApply,false,'same fixed native position cannot cross actual message role/path');
 });
 
 test('ambiguous repeated text, overlapping source and duplicated identity are not guessed',()=>{

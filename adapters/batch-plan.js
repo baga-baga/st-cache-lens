@@ -104,6 +104,13 @@ function markupAtBoundaries(text, boundaries) {
 }
 
 function fieldScope(entry) {
+    // SillyTavern 1.19.0 world-info.js: fixed-position before/after/AN/EM
+    // branches inject content without reading depth, role or outletName.
+    // Imported entries may retain those inactive editor fields (including an
+    // absent role versus 0); they cannot split an otherwise identical actual
+    // message scope. Actual message role, path and outer tags remain checked by
+    // slotSignature. At-depth, outlet and unknown positions stay conservative.
+    if ([0, 1, 2, 3, 5, 6].includes(entry.position)) return stableStringify({ position: entry.position });
     return stableStringify({ position: entry.position ?? null, depth: entry.depth ?? null, role: entry.role ?? null, outletName: entry.outletName ?? null });
 }
 function slotSignature(item) { return `${item.scope}\0${item.role}\0${item.outerScope}\0${fieldScope(item.entry)}`; }

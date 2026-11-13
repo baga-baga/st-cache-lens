@@ -57,6 +57,15 @@ function reasonMetadata(raw) {
     }
     return { code: 'unrecognized-protection-condition', label: '未识别保护条件', category: 'unknown', worldCandidate: null, recognized: false };
 }
+function safeBoundaryFailure(value) {
+    if (!value || typeof value.scope !== 'string' || !/^(?:system(?:\.\d{1,6}\.text)?|messages\.\d{1,6}\.content(?:\.\d{1,6}\.text)?)$/.test(value.scope) || count(value.offset) === null) return null;
+    const symbolCodePoints = rows(value.symbolCodePoints).slice(0, 16).filter(code => {
+        if (typeof code !== 'string' || !/^U\+[0-9A-F]{4,6}$/.test(code)) return false;
+        const n = parseInt(code.slice(2), 16);
+        return n <= 0x10FFFF && !(n >= 0xD800 && n <= 0xDFFF) && !/[\p{L}\p{N}\p{M}_]/u.test(String.fromCodePoint(n));
+    });
+    return { scope: value.scope, offset: value.offset, symbolCodePoints: [...new Set(symbolCodePoints)] };
+}
 function inventoryIndex(report) {
     const inventory = rows(report?.inventory?.entries), byNative = new Map(), byReportRef = new Map();
     for (const [i, entry] of inventory.slice(0, LIMITS.inventory).entries()) {
@@ -113,10 +122,13 @@ export function summarizeBatchPlan(plan, report = null) {
     };
     for (const exclusion of excluded.slice(0, LIMITS.exclusions)) {
         const metadata = reasonMetadata(exclusion?.reason);
-        if (!groups.has(metadata.code)) groups.set(metadata.code, { ...metadata, count: 0, refs: new Set() });
+        if (!groups.has(metadata.code)) groups.set(metadata.code, { ...metadata, count: 0, refs: new Set(), failures: new Map() });
         const group = groups.get(metadata.code), ref = sourceRef(exclusion?.sourceId); group.count++; group.refs.add(ref); allRefs.add(ref);
+        const failure = metadata.category === 'outer-tags' ? safeBoundaryFailure(exclusion?.boundaryFailure) : null;
+        if (failure) group.failures.set(JSON.stringify(failure), failure);
     }
-    const rejectionGroups = [...groups.values()].map(({ refs, ...group }) => ({ ...group, distinctSources: refs.size,
+    const rejectionGroups = [...groups.values()].map(({ refs, failures, ...group }) => ({ ...group, distinctSources: refs.size,
+        boundaryFailures: [...failures.values()].slice(0, 8), boundaryFailuresTruncated: failures.size > 8,
         affectedSourceRefs: [...refs].slice(0, LIMITS.affectedRefs), affectedRefsTruncated: refs.size > LIMITS.affectedRefs }))
         .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code));
     const counts = Object.fromEntries(COUNT_KEYS.map(key => [key, present ? count(plan.counts?.[key]) : null]));
@@ -165,6 +177,8 @@ export function formatPlanRejections(value, report = null) {
     if (sorted.length > 8) text += '其余分类见诊断详情。';
     const eligible = count(summary.counts?.eligibleEntries), selected = count(summary.counts?.selectedEntries);
     if (eligible !== null || selected !== null) text += `通过结构检查 ${eligible ?? '未知'} 条，选中重排 ${selected ?? '未知'} 条。`;
+    const failureSites = new Set(rows(summary.rejectionGroups).flatMap(group => rows(group.boundaryFailures)).map(safeBoundaryFailure).filter(Boolean).map(failure => `${failure.scope}:${failure.offset}`));
+    if (failureSites.size) text += `已记录 ${failureSites.size} 处外层标签解析位置，可能共同影响多个条目，不等于每个条目各自损坏。`;
     const latest = summary.matchingEvidence?.latestReportedMainRequest;
     if (count(latest?.exactMatchedWorldEntries) > 0) text += `报告最后一条可用正文记录中，已有 ${latest.exactMatchedWorldEntries} 条世界书文本被精确定位；上述保护条件不能解释为“没有注入世界书”。`;
     if (summary.coverage?.exclusionsTruncated || summary.coverage?.requestMatchEvidenceTruncated) text += '诊断记录已限量，未覆盖部分保持未知。';

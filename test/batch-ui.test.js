@@ -236,3 +236,20 @@ test('blocked scan exposes exact rejection categories in report without exportin
   assert.equal(h.fetches.length,0);
  }finally{await h.close();}
 });
+
+test('literal Chinese punctuation wrappers permit same-scope preview and live copy without changing wrapper text',async()=>{
+ const f=fixture();f.record.body.messages[0].content='<世界设定（第二阶段）>\n'+f.record.body.messages[0].content+'\n</世界设定（第二阶段）>';
+ const h=await harness({current:f});
+ try{
+  h.emit();await h.click('batch-scan');
+  assert.equal(h.panel.getBatchReport().candidate.canApply,true);
+  await h.click('batch-enable');
+  const meta={...f.record,snapshot:{activationEventSeen:true,generation:{type:'normal',dryRun:false}}};delete meta.body;
+  const out=await h.hooks.transform(structuredClone(f.record.body),meta);
+  assert.equal(meta.batchResult.applied,true);
+  assert.ok(out.messages[0].content.startsWith('<世界设定（第二阶段）>\n'));
+  assert.ok(out.messages[0].content.endsWith('\n</世界设定（第二阶段）>'));
+  assert.ok(out.messages[0].content.indexOf(f.stableText)<out.messages[0].content.indexOf(f.dynamicText));
+  assert.deepEqual(out.messages.map(m=>m.role),f.record.body.messages.map(m=>m.role));assert.equal(h.fetches.length,0);
+ }finally{await h.close();}
+});

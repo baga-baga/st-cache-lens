@@ -11,7 +11,9 @@ import { hasUnsupportedContent } from '../core/providers.js';
 const WORLD_KINDS = new Set(['world-info', 'world_info', 'worldbook']);
 const ROLES = new Set(['system', 'user', 'assistant']);
 const BYTE_TOKENIZER_INTERFACES = new Set(['anthropic', 'openai', 'openai-chat', 'openai-responses', 'deepseek']);
-const TAG_NAME = String.raw`[\p{L}_][\p{L}\p{N}\p{M}_:.·、，-]*`;
+// Literal pseudo-XML labels used by lorebooks; punctuation is never normalized.
+// Angle brackets, slashes, quotes, whitespace, '=', braces and executable syntax remain excluded.
+const TAG_NAME = String.raw`[\p{L}_][\p{L}\p{N}\p{M}_:.·、，：()\[\]（）【】［］-]*`;
 const TAG_START = /^<\/?[\p{L}_]/u;
 const TAG_TOKEN = new RegExp('^<(\\/)?(' + TAG_NAME + ')(?:\\s+[^<>]*?)?\\s*(\\/)?\\s*>$', 'u');
 const TAG_CLOSE = new RegExp('^<\\/' + TAG_NAME + '\\s*>$', 'u');
@@ -51,6 +53,13 @@ const label = value => String(value ?? '').slice(0, 256);
  * Unknown/malformed markup and code-fence interiors fail closed. A textual `< 3`
  * comparison is not treated as a tag. No markup is interpreted or executed.
  */
+function tagBoundaryMetadata(text, start, end = text.length) {
+    // Tag-name prefix only: stop before attributes; retain code points of symbols, not names.
+    const prefix = text.slice(start + 1, end).replace(/^\//, '').split(/\s/u, 1)[0].replace(/\/$/, '');
+    const symbols = [...prefix].filter(char => !/[\p{L}\p{N}\p{M}_]/u.test(char));
+    return { offset: start, symbolCodePoints: [...new Set(symbols.slice(0, 16).map(char => 'U+' + char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')))] };
+}
+
 function markupAtBoundaries(text, boundaries) {
     const points = [...new Set(boundaries)].sort((a, b) => a - b), result = new Map(), stack = [];
     let point = 0, cursor = 0;
@@ -69,7 +78,7 @@ function markupAtBoundaries(text, boundaries) {
         }
         if (/^<[!?]/.test(text.slice(start))) return { ok: false, reason: 'unsupported-markup' };
         if (!TAG_START.test(text.slice(start))) {
-            if (/^<\/?[^\s\d=<>]/u.test(text.slice(start))) return { ok: false, reason: 'unsupported-tag-name' };
+            if (/^<\/?[^\s\d=<>]/u.test(text.slice(start))) return { ok: false, reason: 'unsupported-tag-name', boundaryFailure: tagBoundaryMetadata(text, start, text.indexOf('>', start) < 0 ? text.length : text.indexOf('>', start)) };
             cursor = start + 1; continue;
         }
         let end = start + 1, quote = null;
@@ -83,7 +92,7 @@ function markupAtBoundaries(text, boundaries) {
         if (points.some(p => p > start && p < end + 1)) return { ok: false, reason: 'source-boundary-inside-tag' };
         const tag = text.slice(start, end + 1);
         const match = TAG_TOKEN.exec(tag);
-        if (!match) return { ok: false, reason: 'unsupported-tag-syntax' };
+        if (!match) return { ok: false, reason: 'unsupported-tag-syntax', boundaryFailure: tagBoundaryMetadata(text, start, end) };
         if (match[1]) {
             if (match[3] || !TAG_CLOSE.test(tag) || stack.pop()?.name !== match[2]) return { ok: false, reason: 'mismatched-tag' };
         } else if (!match[3]) stack.push({ name: match[2], offset: start });
@@ -142,7 +151,7 @@ export function buildBatchPlan({ record, setup = {}, limits, inputEvidence = nul
     try { slots = textSlots(record.body); } catch { reasons.push('当前请求的消息结构不受支持。'); return result; }
     const sources = Array.isArray(record.sources) ? record.sources : [];
     const accepted = [], sourceIds = new Map();
-    const exclude = (source, reason) => exclusions.push({ sourceId: label(source?.id), reason, message: EXCLUSION_MESSAGES[reason] ?? (reason.startsWith('unsafe-outer-markup:') ? '外层标签或注释结构不明确，不能安全调整。' : '此来源未通过自动范围检查。') });
+    const exclude = (source, reason, boundaryFailure = null) => exclusions.push({ sourceId: label(source?.id), reason, message: EXCLUSION_MESSAGES[reason] ?? (reason.startsWith('unsafe-outer-markup:') ? '外层标签或注释结构不明确，不能安全调整。' : '此来源未通过自动范围检查。'), ...(boundaryFailure ? { boundaryFailure } : {}) });
     for (const [index, source] of sources.entries()) {
         const kind = source?.kind ?? source?.type;
         if (!WORLD_KINDS.has(kind)) { exclude(source, 'not-explicit-world-info'); continue; }
@@ -197,7 +206,7 @@ export function buildBatchPlan({ record, setup = {}, limits, inputEvidence = nul
         const markup = markupAtBoundaries(group[0].slot.text, group.flatMap(e => [e.start, e.end]));
         for (const item of group) {
             if (item.ambiguous) { exclude(item.source, 'overlapping-or-ambiguous-source'); continue; }
-            if (!markup.ok) { exclude(item.source, 'unsafe-outer-markup:' + markup.reason); continue; }
+            if (!markup.ok) { exclude(item.source, 'unsafe-outer-markup:' + markup.reason, markup.boundaryFailure ? { scope: item.scope, ...markup.boundaryFailure } : null); continue; }
             if (markup.contexts.get(item.start) !== markup.contexts.get(item.end)) { exclude(item.source, 'entry-crosses-outer-tag-scope'); continue; }
             item.outerScope = markup.contexts.get(item.start); eligible.push(item);
         }

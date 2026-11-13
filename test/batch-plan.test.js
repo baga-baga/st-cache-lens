@@ -180,3 +180,34 @@ test('explicit snapshot without current activation prevents string-only provenan
  const r2=record();r2.world={activationEventSeen:false};assert.equal(plan(r2).canApply,false);
  const r3=record();r3.world={activationEventSeen:true,activeEntries:[dynamic.entry,stable.entry]};assert.equal(plan(r3).canApply,true);
 });
+
+test('literal paired pseudo-tag names support bounded ASCII/fullwidth punctuation without normalization',()=>{
+ for(const name of ['世界（基础）','世界(基础)','世界[基础]','世界［基础］','世界【基础】','世界：基础','世界(基础)[补充]：阶段（二）']) {
+  const r=record([dynamic,stable],`<${name}>`+dynamic.text+'\n'+stable.text+`</${name}>`);
+  const p=plan(r);assert.equal(p.canApply,true,`${name}: ${p.reasons.join()}`);
+  assert.ok(p.previewBody.messages[0].content.includes(`<${name}>`+stable.text+'\n'+dynamic.text+`</${name}>`));
+ }
+ const mismatch=record([dynamic,stable],'<世界（基础）>'+dynamic.text+'\n'+stable.text+'</世界(基础)>');assert.equal(plan(mismatch).canApply,false);
+});
+
+test('expanded literal names retain separate opening-offset scopes and reject split tags or macros',()=>{
+ const split=record([dynamic,stable],'<世界（基础）>'+dynamic.text+'</世界（基础）><世界（基础）>'+stable.text+'</世界（基础）>');assert.equal(plan(split).canApply,false);
+ const broken=source('broken','<角色（阶段二）>没有独立闭合。',{constant:true});assert.equal(plan(record([dynamic,broken])).canApply,false);
+ const macro=record([dynamic,stable],'<世界{{stage}}>'+dynamic.text+'\n'+stable.text+'</世界{{stage}}>');assert.equal(plan(macro).canApply,false);
+ const unsupported=record([dynamic,stable],'<世界@基础>'+dynamic.text+'\n'+stable.text+'</世界@基础>');assert.equal(plan(unsupported).canApply,false);
+});
+
+test('attribute-bearing self-closing tags stay self-closing and quoted greater-than support remains unchanged',()=>{
+ for(const token of ['<tag x="1"/>','<tag x="1" />','<tag/>','<tag />']) {
+  const r=record([dynamic,stable],'<世界（基础）>'+token+dynamic.text+'\n'+stable.text+'</世界（基础）>');assert.equal(plan(r).canApply,true,token);
+ }
+ const quoted=record([dynamic,stable],'<tag test="a > b">'+dynamic.text+'\n'+stable.text+'</tag>');assert.equal(plan(quoted).canApply,false);
+});
+
+test('unsupported tag diagnostics include only numeric scope offset and symbol code points',()=>{
+ const r=record([dynamic,stable],'<敏感名字$内部>'+dynamic.text+'\n'+stable.text+'</敏感名字$内部>');
+ const p=plan(r);assert.equal(p.canApply,false);const failure=p.exclusions.find(e=>e.reason==='unsafe-outer-markup:unsupported-tag-syntax')?.boundaryFailure;
+ assert.ok(failure);assert.equal(failure.scope,'messages.0.content');assert.equal(Number.isSafeInteger(failure.offset),true);assert.deepEqual(failure.symbolCodePoints,['U+0024']);
+ const printed=JSON.stringify(failure);assert.ok(!printed.includes('敏感'));assert.ok(!printed.includes('内部'));assert.deepEqual(Object.keys(failure).sort(),['offset','scope','symbolCodePoints']);
+ const later=record([dynamic,stable],dynamic.text+'\n'+stable.text+'<后文$未知>保持原样</后文$未知>');assert.equal(plan(later).canApply,false,'unchanged unsupported suffix is still conservatively checked');
+});

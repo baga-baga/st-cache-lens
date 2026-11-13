@@ -57,3 +57,16 @@ test('unrecognized private inventory refs are replaced, and summaries with no po
  assert.deepEqual(result.rejectionGroups[0].affectedSourceRefs,['entry-1']);assert.equal(result.matchingEvidence.latestReportedMainRequest.requestRef,'request-1');assert.equal(result.matchingEvidence.maximumExactMatchedWorldEntries,0);
  assert.equal(result.matchingEvidence.conclusion,'no-positive-match-established-by-this-export');assert.equal(JSON.stringify(result).includes(secret),false);
 });
+
+test('shared outer failure exports only bounded position and non-name symbol code points',()=>{
+ const failure={scope:'messages.6.content',offset:123,symbolCodePoints:['U+0024','U+4E16','U+0041','U+0031','U+005F','U+FFFFFE','SECRET','U+0024'],tag:secret,attribute:secret};
+ const one={sourceId:'world:'+secret+':7',reason:'unsafe-outer-markup:unsupported-tag-syntax',boundaryFailure:failure};
+ const two={...one,sourceId:'world:'+secret+':8'};
+ const result=summarizeBatchPlan({...plan,exclusions:[one,two]},report);const group=result.rejectionGroups[0];
+ assert.equal(group.count,2);assert.deepEqual(group.boundaryFailures,[{scope:'messages.6.content',offset:123,symbolCodePoints:['U+0024']}]);
+ assert.equal(JSON.stringify(result).includes(secret),false);assert.match(formatPlanRejections(result),/1 处外层标签解析位置/);
+ for(const bad of [{...failure,scope:secret},{...failure,offset:Infinity},{...failure,offset:-1}]){
+  const safe=summarizeBatchPlan({...plan,exclusions:[{...one,boundaryFailure:bad}]},report);
+  assert.deepEqual(safe.rejectionGroups[0].boundaryFailures,[]);assert.equal(JSON.stringify(safe).includes(secret),false);
+ }
+});

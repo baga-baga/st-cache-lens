@@ -104,3 +104,45 @@ test('large combined reports retain safety caveats within mobile output bound', 
     assert.ok(text.length <= 1200, text.length); assert.match(text, /不会自动发起付费请求/);
     assert.match(text, /未证明唯一失效原因或费用下降/); assert.match(text, /不是实际 tokens/);
 });
+
+test('unknown extension does not imply missing preset order when current order is known', () => {
+    const r = analyzeSetup({ ...setup, extensionSources: [{ id: 'extension:unknown', text: 'PRIVATE_EXTENSION_TEXT' }] }, { limits });
+    assert.equal(r.preset.orderKnown, true);
+    assert.ok(r.settingsFindings.some(f => f.code === 'UNKNOWN_EXTENSIONS_READ_ONLY'));
+    const text = batchSummary(r);
+    assert.match(text, /部分扩展缺少明确适配，其内部状态保持只读/);
+    assert.doesNotMatch(text, /预设顺序未确认|PRIVATE_EXTENSION_TEXT/);
+    r.settingsFindings.push({ code: 'PRESET_ORDER_UNKNOWN' });
+    assert.doesNotMatch(batchSummary(r), /预设顺序未确认/);
+});
+
+test('missing preset order is stated independently of extension adapter coverage', () => {
+    const r = analyzeSetup({ ...setup, preset: { prompts: [] } }, { limits });
+    assert.equal(r.preset.orderKnown, false);
+    const text = batchSummary(r);
+    assert.match(text, /预设顺序未确认，相关部分只读/);
+    assert.doesNotMatch(text, /部分扩展缺少明确适配/);
+});
+
+test('zero eligible entries does not erase observed source matches', () => {
+    const r = record();
+    for (const source of r.sources) source.provenance = 'unknown-extension';
+    const diagnostic = report([r]);
+    assert.equal(diagnostic.requestGroups[0].requests[0].exactSourceOccurrences.length, 2);
+    const plan = buildBatchPlan({ record: r, setup: { complete: true, batchAuthorized: true }, limits });
+    assert.equal(plan.counts.eligibleEntries, 0);
+    const text = batchSummary(diagnostic, plan);
+    assert.match(text, /没有范围通过全部自动排序检查/);
+    assert.match(text, /已激活或已匹配条目仍可能被其他保护条件排除/);
+    assert.doesNotMatch(text, /无已激活且可唯一定位/);
+});
+
+test('derived budget is a Cache Lens reference even when actual scan budget differs or basis metadata is absent', () => {
+    const r = report();
+    r.worldQuantities.budget = { derivedLimit: { value: 200000 }, observedScanLimit: { value: 1970000 } };
+    const text = batchSummary(r);
+    assert.match(text, /按 Cache Lens 上下文上限推算的预算参考值 200,000 tokens，非实测扫描预算/);
+    assert.doesNotMatch(text, /配置推导的世界书预算上限|实测扫描预算 200,000|1,970,000 tokens，非实测/);
+    r.worldQuantities.budget.contextBasis = { source: 'cache-lens-limits', value: 200000 };
+    assert.match(batchSummary(r), /预算参考值 200,000 tokens，非实测扫描预算/);
+});

@@ -8,6 +8,7 @@ import { collectCurrentSetup, getSetupInputs } from './adapters/batch-scan.js';
 import { analyzeSetup } from './core/batch-diagnostics.js';
 import { buildBatchPlan } from './adapters/batch-plan.js';
 import { batchSummary } from './adapters/batch-view.js';
+import { summarizeBatchPlan, formatPlanRejections } from './adapters/batch-plan-report.js';
 import { runBatchPolicy, EMPTY_BATCH_POLICY, BATCH_ALGORITHM } from './adapters/batch-runner.js';
 import { observationLayer, ledgerRecords, pricesFor, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence } from './adapters/reporting.js';
 import { hasObservedContext, normalizeUISources, worldSummary } from './adapters/ui-data.js';
@@ -45,7 +46,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.3</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.4</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
@@ -53,6 +54,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     <label><input type="checkbox" data-id="batchFollow">自动跟随切卡、预设变化和正常请求重新扫描（免费）</label>
     <p class="cl-note">一次读取当前绑定的世界书、当前预设和记忆来源，自动汇总问题。扫描不生成剧情，也不调用优化模型。</p>
     <div data-id="batchSummary" class="cl-diagnostic-summary">点击扫描即可开始，无需逐条找条目或截图。</div>
+    <div data-id="batchBlockers" class="cl-note"></div>
     <div class="cl-toolbar"><button data-action="batch-mark-main" hidden>将当前连接的未归类请求标为正文</button><button data-action="batch-enable">启用跨角色安全排序</button><button data-action="batch-rollback">恢复上一批量设置</button><button data-action="batch-export">导出设置报告（无正文）</button><button data-action="batch-agent">让 Agent 复核报告（按预算计费）</button></div>
     <p class="cl-note">启用排序表示一次授权：在当前正文接口与模型下，后续角色逐请求检查已激活的完整世界书片段，仅在同一消息、同一作用范围内将合格的常驻资料前置。原书触发与排序字段保持原值。结构校验不证明剧情语义或真实节省；没有可用方案或输入上界无法通过时自动跳过。</p>
     <div data-id="batchPolicy" class="cl-status"></div><div data-id="batchAgent" class="cl-note"></div>
@@ -166,6 +168,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   function renderBatch() {
     $(root,'[data-id="batchFollow"]').checked=settings.batchFollow===true;
     out('batchSummary',batchReport?batchSummary(batchReport,batchPlan):'点击扫描即可读取当前绑定的全部设置，无需逐条找条目或截图。');
+    out('batchBlockers',batchPlan?formatPlanRejections(batchPlan,batchReport):'');
     const p=settings.batchPolicy;
     out('batchPolicy',p?.enabled?`批量策略 v${p.version} 已启用：${p.connection?.provider} / ${p.connection?.model}。当前模式：${settings.mode==='diagnose'?'只诊断，排序暂停':'允许已校验请求副本排序'}。${lastBatchResult?'\n最近一次检查：'+lastBatchResult.reason:''}`:'批量排序未启用；当前只读扫描不会修改剧情输入。');
     const b=batchConnection();
@@ -182,6 +185,8 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       const report=analyzeSetup(setup,{records,limits:limits()});
       const r=batchCurrentRecord(setup);
       const candidate=buildBatchPlan({record:r,setup:{...setup,batchAuthorized:true},limits:limits()});
+      const requestRef=report.requestGroups.flatMap(group=>group.requests).find(item=>item.id===r?.id)?.ref;
+      report.candidate={...summarizeBatchPlan(candidate,report),requestRef:/^r\d+$/.test(requestRef||'')?requestRef:null};
       batchSetup=setup;batchReport=report;batchPlan=candidate;batchRecordId=r?.id??null;
       out('batchDetails',report);out('batchAgent','');
       if(follow&&!settings.batchFollow){settings.batchFollow=true;await persist();}

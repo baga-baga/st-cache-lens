@@ -10,7 +10,8 @@ const issueGroups = [
     [['LARGE_CONSTANT_SET', 'BUDGET_BYPASS_ENABLED'], '常驻量较大或存在绕过世界书预算的设置'],
     [['ACTIVATION_SET_CHANGED', 'OBSERVED_ENTRY_ORDER_CHANGED', 'SOURCE_SCOPE_CHANGED', 'OBSERVED_SOURCE_TEXT_CHANGED'], '已观察到激活集合、排列、作用域或来源文字变化'],
     [['EXACT_TEXT_REPEATED_IN_CONFIG', 'EXACT_REPEATED_REQUEST_TEXT'], '存在完全相同文本；配置重复与实际重复注入须分开核实'],
-    [['PRESET_ORDER_UNKNOWN', 'UNKNOWN_EXTENSIONS_READ_ONLY'], '预设顺序未确认或扩展缺少明确适配，相关部分只读'],
+    [['PRESET_ORDER_UNKNOWN'], '预设顺序未确认，相关部分只读'],
+    [['UNKNOWN_EXTENSIONS_READ_ONLY'], '部分扩展缺少明确适配，其内部状态保持只读'],
     [['SHARED_INSERTION_ORDER'], '多个条目排序值相同；这不证明随机乱序'],
 ];
 
@@ -49,7 +50,7 @@ function planSummary(plan) {
         [/需要明确当前聊天|范围不一致/, '聊天、模型或授权范围尚未匹配'],
         [/有效的输入上限/, '尚未设置有效输入及上下文上限'],
         [/多模态|接口尚不支持|消息结构不受支持/, '接口或内容结构暂不支持此输入保护'],
-        [/没有实际激活/, '无已激活且可唯一定位的合格范围'],
+        [/没有实际激活/, '没有范围通过全部自动排序检查；已激活或已匹配条目仍可能被其他保护条件排除'],
         [/守恒|作用域校验失败/, '内容守恒或作用域检查未通过'],
     ];
     for (const [pattern, label] of reasonRules) if (pattern.test(reasons)) labels.push(label);
@@ -68,7 +69,7 @@ export function batchSummary(report, plan = null) {
         : '扫描会自动读取当前绑定书与预设，无需逐条截图；本次资料不完整，相关自动调整受限。';
     const inventory = `已读取 ${num(c.loadedBooks)} / ${num(c.booksExpected ?? c.books)} 本绑定书，共 ${num(c.entries)} 条：常驻 ${num(c.constant)}、关键词 ${num(c.keyword)}、向量 ${num(c.vector)}、停用 ${num(c.disabled)}、其他/未知 ${num(c.conditionalOrUnknown)}；预设 ${num(c.presetPrompts)} 项。关键词触发概率 100% 仍不等于常驻。`;
     const whole = finite(q.wholeBook?.value) ? `整书总量约 ${num(q.wholeBook.value)} tokens（含停用条目）` : `整书总量未知${finite(q.observedInventoryPartial?.value) ? `，已读取部分约 ${num(q.observedInventoryPartial.value)} tokens` : ''}`;
-    const budget = finite(q.budget?.derivedLimit?.value) ? `配置推导的世界书预算上限 ${num(q.budget.derivedLimit.value)} tokens` : '世界书预算上限未知';
+    const budget = finite(q.budget?.derivedLimit?.value) ? `按 Cache Lens 上下文上限推算的预算参考值 ${num(q.budget.derivedLimit.value)} tokens，非实测扫描预算` : '按 Cache Lens 上下文上限推算的预算参考值未知';
     const quantities = `${whole}；${budget}。整书是字节估算，不是本轮激活量或最终发送量；整书超过上限不等于实际请求超限。世界书单独最终发送 tokens 尚未知。`;
     const notes = [];
     if (coverage.requestAnalysisTruncated || coverage.sourceAnalysisTruncated) notes.push('观察记录或来源分析已限量，不能据未覆盖部分判断稳定。');
@@ -78,7 +79,7 @@ export function batchSummary(report, plan = null) {
     const after = [planSummary(plan), end];
     const findings = rows(report.settingsFindings), issues = [];
     for (const [codes, label] of issueGroups) {
-        const matches = findings.filter(f => codes.includes(f?.code));
+        const matches = findings.filter(f => codes.includes(f?.code) && !(f.code === 'PRESET_ORDER_UNKNOWN' && report.preset?.orderKnown === true));
         if (!matches.length) continue;
         issues.push(label);
         if (issues.length === 6) break;

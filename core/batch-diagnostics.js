@@ -24,7 +24,8 @@ function configBudget(settings,snapshot,limits){
     const derived=finite(percent)&&finite(context)&&context>0?Math.floor(context*percent/100):null;
     const configured=derived!==null?(finite(cap)&&cap>0?Math.min(derived,cap):derived):finite(cap)&&cap>0?cap:null;
     return {configuredPercent:finite(percent)?percent:null,configuredTokenCap:finite(cap)?cap:null,
-        derivedLimit:quantity(configured,'configured-limit','Derived from configured context × WI percentage and positive token cap; not actual usage.'),
+        contextBasis:'cache-lens-configured-limit',contextTokensUsed:finite(context)&&context>0?context:null,
+        derivedLimit:quantity(configured,'configured-limit','Reference computed from the Cache Lens context limit × WI percentage and positive token cap; not the native scan budget or actual usage.'),
         observedScanLimit:quantity(snapshot?.budgetTokens,'observed-limit','Last captured WI scan budget, possibly a dry run; not actual included tokens.')};
 }
 function triggerMode(entry){

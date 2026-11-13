@@ -53,6 +53,28 @@ test('1.5 million budget, activation estimate, whole book and usage total are di
  assert.equal(r.worldQuantities.worldInfoFinalSentTokens,null);
 });
 
+test('derived budget names Cache Lens context basis separately from a different observed native scan limit',()=>{
+ const es=baseEntries();
+ const setup=makeSetup(es,{worldSettings:{world_info_budget:100,world_info_budget_cap:0},snapshot:{budgetTokens:1970000}});
+ const request=record('a',es,{world:{activationEventSeen:true,activeEntries:es,budgetTokens:1970000}});
+ const r=analyzeSetup(setup,{records:[request],limits});
+ const budget=r.worldQuantities.budget;
+ assert.equal(budget.contextBasis,'cache-lens-configured-limit');
+ assert.equal(budget.contextTokensUsed,200000);
+ assert.equal(budget.derivedLimit.value,200000);
+ assert.match(budget.derivedLimit.method,/Cache Lens context limit/);
+ assert.match(budget.derivedLimit.method,/not the native scan budget/);
+ assert.equal(budget.observedScanLimit.value,1970000);
+ assert.equal(r.requestGroups[0].requests[0].budget.value,1970000);
+ assert.equal(r.worldQuantities.finalInput[0].value,null);
+ assert.deepEqual(r.agentDigest.worldQuantities.budget,budget);
+ assert.equal(r.safety.canPrepareCandidate,true);
+ const missing=analyzeSetup(setup,{limits:{maxInputTokens:160000}}).worldQuantities.budget;
+ assert.equal(missing.contextTokensUsed,null);
+ assert.equal(missing.derivedLimit.value,null);
+ assert.equal(missing.observedScanLimit.value,1970000);
+});
+
 test('missing books, missing activation, missing usage remain unknown and block preparation when collection incomplete',()=>{
  const setup=makeSetup([], {books:[],complete:false,optimizationBlocked:true,counts:{booksExpected:2}});
  const r=analyzeSetup(setup,{records:[record('a',[],{world:{},usage:null})],limits});

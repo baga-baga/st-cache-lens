@@ -221,3 +221,18 @@ test('full restore disables batch policy and restores its original linked baseli
   assert.equal(h.fetches.length,0);
  }finally{await h.close();}
 });
+
+test('blocked scan exposes exact rejection categories in report without exporting request prose',async()=>{
+ const f=fixture();f.record.body.messages[0].content='```text\n'+f.record.body.messages[0].content+'\n```';
+ const h=await harness({current:f});
+ try{
+  h.emit();await h.click('batch-scan');
+  const report=h.panel.getBatchReport(),candidate=report.candidate;
+  assert.ok(candidate);assert.equal(candidate.canApply,false);assert.equal(candidate.requestRef,'r1');
+  assert.match(JSON.stringify(candidate),/message-with-code-fence-needs-manual-review/);
+  assert.doesNotMatch(JSON.stringify(candidate),/完整事实|稳定设定|PRIVATE|<lore>/);
+  assert.match(h.q('[data-id="batchBlockers"]').textContent,/围栏/);
+  assert.ok(report.requestGroups[0].requests[0].exactSourceOccurrences.filter(s=>s.ref.startsWith('b')).length>=2);
+  assert.equal(h.fetches.length,0);
+ }finally{await h.close();}
+});

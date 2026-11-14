@@ -9,7 +9,9 @@ import { analyzeSetup } from './core/batch-diagnostics.js';
 import { buildBatchPlan } from './adapters/batch-plan.js';
 import { batchSummary } from './adapters/batch-view.js';
 import { summarizeBatchPlan, formatPlanRejections } from './adapters/batch-plan-report.js';
-import { createAuditPacket, runAgentAudit } from './adapters/agent-audit.js';
+import { createAuditPacket, runAgentAudit, safeAuditFailure } from './adapters/agent-audit.js';
+import { auditCollectionEvidence, collectionBlockingCodes, collectionIssueMessage } from './adapters/audit-evidence.js';
+import { sanitizeAgentHistory, auditFailureMessage, agentHistorySummary } from './adapters/audit-recovery.js';
 import { auditBudget } from './adapters/agent-audit-budget.js';
 import { boundedWait } from './adapters/bounded-wait.js';
 import { runBatchPolicy, EMPTY_BATCH_POLICY, BATCH_ALGORITHM } from './adapters/batch-runner.js';
@@ -54,7 +56,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.9</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.10</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
@@ -67,7 +69,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     <details open><summary>Agent 全面检查 · 当前角色配置</summary>
       <p class="cl-note">自动重新采集全部绑定世界书、当前预设、公开扩展来源和已有请求，分批交给你配置的 Agent 检查，最后汇总方案。默认只发送设置和诊断元数据，不上传整本世界书；不扫描其他未绑定角色或未知插件内部文件。</p>
       <label><input type="checkbox" data-id="auditExcerpts">允许发送问题附近的局部正文（最多 10 段，每段 600 字符；可能包含角色名称和剧情）</label>
-      <div class="cl-toolbar"><button data-action="audit-setup">设置 Agent 地址、模型与预算</button><button data-action="batch-agent">Agent 全面检查当前配置</button><button data-action="audit-stop" disabled>停止后续 Agent 调用</button><button data-action="audit-apply" hidden>预览并应用 Agent 方案</button><button data-action="audit-export" hidden>导出 Agent 检查结果</button></div>
+      <div class="cl-toolbar"><button data-action="audit-setup">设置 Agent 地址、模型与预算</button><button data-action="batch-agent">Agent 全面检查当前配置</button><button data-action="audit-recover">读取失败原因与采集状态（免费）</button><button data-action="audit-stop" disabled>停止后续 Agent 调用</button><button data-action="audit-apply" hidden>预览并应用 Agent 方案</button><button data-action="audit-export" hidden>导出 Agent 检查结果</button></div>
       <div data-id="auditProgress" class="cl-status" role="status">先完成本机采集和预算核对，预算不足时不会调用模型。无需为检查额外发送剧情。</div>
       <pre data-id="auditResult" class="cl-note"></pre>
     </details>
@@ -265,6 +267,14 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     const report=await scanBatch({audit:true,signal:controller.signal});if(!report)throw new Error('采集已停止或配置已变化；未调用模型。');
     await new Promise(resolve=>setTimeout(resolve,0));if(controller.signal.aborted)throw new Error('检查已停止；未调用模型。');assertIdle();assertFresh();
     const packet=createAuditPacket(report,{plan:batchPlan,limits:limits(),setup:batchSetup,records,shareExcerpts:$(root,'[data-id="auditExcerpts"]').checked});
+    const collectionIssues=collectionBlockingCodes(packet.coverage.collection);
+    if(collectionIssues.length){
+      auditResult={status:'blocked',reason:'AUDIT_COLLECTION_INCOMPLETE',reviewedPages:0,totalPages:packet.pages.length,coverage:packet.coverage,notes:[],synthesis:'',calls:0,selectedCandidateId:null,collectionIssues,notice:'本机关键资料未读全，未发起模型请求。零世界书不代表文件已删除。'};
+      out('auditProgress','本机关键资料尚未读全，已停止付费检查；没有调用 Agent。');
+      out('auditResult',collectionSummary(packet.coverage.collection));
+      $(root,'[data-action="audit-export"]').hidden=false;
+      return;
+    }
     out('auditProgress',`已本机读取 ${report.counts.entries} 条世界书、${report.counts.presetPrompts} 项预设、${report.counts.extensionSources} 个扩展来源。Agent 将分 ${packet.pages.length} 批检查，再统一汇总，共需 ${packet.requiredCalls} 次调用。`);
     if(packet.tooManyPages)throw new Error('当前配置超过单次 Agent 检查的 24 批上限；已保留本机报告，尚未调用模型。');
     if(settings.maxTests<1||settings.maxCost<=0)throw new Error('未配置 Agent 付费预算；本机采集已完成，请在下方 Agent 设置保存预算后再点击。');
@@ -288,8 +298,9 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       auditResult={...result,notice:'仅检查当前绑定配置及已观测请求；模型意见不是服务端缓存证据或自动修改授权。',excerptsShared:share};
       if(!disposed){
         const reasons={AUDIT_CANCELLED_OR_STALE:'已停止，或配置/请求已改变。',INVALID_AUDIT_RESPONSE:'模型未返回要求的结构化格式，已停止，不会自动重试。',UNAUTHORIZED_AUDIT_OPERATION:'模型提出了越权操作，已阻止。',AUDIT_STOPPED_AFTER_ERROR:'调用失败或状态核验失败，已停止，不会自动重试。',INSUFFICIENT_CALL_BUDGET:'剩余调用次数不足。',AUDIT_SCOPE_REQUIRES_TOO_MANY_CALLS:'当前配置超过单次检查的分页范围。',AUDIT_SYNTHESIS_TOO_LARGE:'汇总超出本次传输上限。'};
-        out('auditProgress',result.status==='complete'?`Agent 检查完成：${result.reviewedPages} / ${result.totalPages} 批；共 ${result.calls} 次调用。${report.coverage.complete?'当前绑定设置元数据已覆盖；不等于全文语义审查。':'本机采集存在缺口，详见报告。'}`:`Agent 检查未完成：${result.reviewedPages} / ${result.totalPages} 批。${reasons[result.reason]||'已停止。'} 已发生调用仍计费。`);
-        out('auditResult',result.synthesis||result.notes?.map((n,i)=>`第 ${i+1} 批：${typeof n==='string'?n:JSON.stringify(n)}`).join('\n\n')||result.reason||'没有可展示的结果。');
+        out('auditProgress',result.status==='complete'?`Agent 检查完成：${result.reviewedPages} / ${result.totalPages} 批；共 ${result.calls} 次调用。${report.coverage.complete?'当前绑定设置元数据已覆盖；不等于全文语义审查。':'本机采集存在缺口，详见报告。'}`:`Agent 检查未完成：${result.reviewedPages} / ${result.totalPages} 批。${reasons[result.reason]||'已停止。'} 已发出的请求可能计费，实际以服务端记录和账单为准。`);
+        const failureText=result.failure?`${auditFailureMessage(result.failure)}\n错误代码：${result.failure.code}`:'';
+        out('auditResult',[failureText,result.synthesis||result.notes?.map((n,i)=>`第 ${i+1} 批：${typeof n==='string'?n:JSON.stringify(n)}`).join('\n\n')||result.reason||'没有可展示的结果。'].filter(Boolean).join('\n\n'));
         $(root,'[data-action="audit-export"]').hidden=false;
         if(result.status==='complete'&&result.selectedCandidateId==='current-batch'&&await stillCurrent()){
           auditSelection={epoch,revision,recordId};$(root,'[data-action="audit-apply"]').hidden=false;
@@ -302,6 +313,29 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       // Also recover billed failed calls: the server retains usage or a reservation.
       if(serverStatus?.configured&&!disposed)try{const data=await api('agent-records');for(const r of data.records||[])addRecord(agentObservation(r));}catch{/* Keep server ledger authoritative when collection is unavailable. */}
     }
+  }
+  function collectionSummary(evidence) {
+    if(!evidence)return '本次未取得完整的本机采集状态。';
+    const totals=evidence.totals||{},blocking=collectionBlockingCodes(evidence);
+    return [`本机采集：世界书 ${display(totals.booksLoaded)} / ${display(totals.booksExpected)} 本，条目 ${display(totals.entriesPrepared)} 条，预设 ${display(totals.presetsPrepared)} 项。`,
+      `请求记录 ${display(totals.requestRecords)} 条，可读取原文 ${display(totals.requestBodiesObserved)} 条；缺少原文时不能重新逐字比较。`,
+      ...(blocking.length?blocking:evidence.codes||[]).slice(0,12).map(code=>collectionIssueMessage(code)),
+      blocking.length?'关键采集缺口解决前，不发起全面检查的付费调用。':'本次免费检查没有调用模型。'].join('\n');
+  }
+  async function recoverAuditDiagnostics() {
+    assertIdle();assertFresh();auditSelection=null;$(root,'[data-action="audit-apply"]').hidden=true;
+    out('auditProgress','正在免费读取本机采集状态和服务端已有 Agent 记录；不会调用模型……');
+    let collection=null,collectionFailure=null,history=null,historyFailure=null;
+    try{const report=await scanBatch({audit:true});if(report)collection=auditCollectionEvidence(report,batchSetup);}
+    catch(error){collectionFailure=safeAuditFailure(error,{stage:'collection'});}
+    try{const [status,data]=await Promise.all([api('status'),api('agent-records')]);serverStatus=status;history=sanitizeAgentHistory(data.records,status);}
+    catch(error){historyFailure=safeAuditFailure(error,{stage:'history-recovery'});}
+    if(disposed)return;
+    const recovery={readAt:new Date().toISOString(),modelCallsMade:0,collection,collectionFailure,history,historyFailure};
+    auditResult={...(auditResult||{status:'diagnostic-only',reason:'READ_ONLY_RECOVERY',calls:0,selectedCandidateId:null}),recovery};
+    out('auditProgress','免费读取已结束，未新增模型调用。历史失败记录不自动等同于某次检查的失败原因。');
+    out('auditResult',[collectionSummary(collection),collectionFailure?auditFailureMessage(collectionFailure):'',history?agentHistorySummary(history):'',historyFailure?auditFailureMessage(historyFailure):''].filter(Boolean).join('\n\n'));
+    $(root,'[data-action="audit-export"]').hidden=false;
   }
   async function initializeStore() {
     try {
@@ -391,9 +425,12 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
     const paid=path==='agent';
     return boundedWait(async requestSignal=>{
       const headers=context.getRequestHeaders?.()||{'Content-Type':'application/json'};
-      const r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body),signal:requestSignal});
+      let r;
+      try{r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body),signal:requestSignal});}
+      catch{throw Object.assign(new Error('浏览器连接酒馆服务端失败；此前请求可能仍在处理，未自动重试。'),{code:'CLIENT_NETWORK_ERROR'});}
       if(!r.ok){let code='';try{const data=await r.json();if(/^[A-Z0-9_]{1,100}$/.test(data.error))code=data.error;}catch{}const error=new Error(agentSetupError(code,r.status));error.code=code;error.httpStatus=r.status;throw error;}
-      return await r.json();
+      try{return await r.json();}
+      catch{throw Object.assign(new Error('酒馆服务端未返回可解析的 JSON；未自动重试。'),{code:'SERVER_RESPONSE_INVALID_JSON',httpStatus:r.status});}
     },{timeoutMs:paid?deadlines.agent:deadlines.read,signal,message:paid?'等待 Agent 返回超时；已停止后续调用，不会自动重试。服务端这次调用仍可能完成并计费，请先刷新费用记录。':'酒馆服务端响应超时；未自动重试，请检查酒馆是否仍在运行。'});
   }
   async function checkAgentServer() {
@@ -502,6 +539,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       await enableBatch();auditSelection=null;$(root,'[data-action="audit-apply"]').hidden=true;
     },
     'audit-export'(){if(!auditResult)throw new Error('尚无 Agent 检查结果。');download('cache-lens-agent-audit.json',auditResult);},
+    'audit-recover':recoverAuditDiagnostics,
     'batch-export'(){if(!batchReport)throw new Error('先免费扫描当前配置。');download('cache-lens-settings-report.json',{...batchReport,notice:'包含世界书/条目名称与设置，不含提示词正文、触发词文本或密钥。仅为本地诊断，不能证明实际节省。'});},
     async 'batch-mark-main'(){
       assertIdle();assertFresh();const b=batchConnection();if(!b||[b.provider,b.model].some(x=>!x||x==='unknown'))throw new Error('先扫描有效的当前连接。');

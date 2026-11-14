@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAuditPacket, runAgentAudit, AUDIT_PAGE_BYTES } from '../adapters/agent-audit.js';
+import { createAuditPacket, runAgentAudit, safeAuditFailure, AUDIT_PAGE_BYTES } from '../adapters/agent-audit.js';
 import { redactDiagnostic } from '../server/agent.mjs';
 const bytes=v=>new TextEncoder().encode(JSON.stringify(v)).byteLength;
 function fixture(n=473){
@@ -16,6 +16,8 @@ test('all 473 entries, 87 presets, 15 public sources and every finding target su
  assert.equal(all(packet,'entries').length,473);assert.equal(all(packet,'presets').length,87);assert.equal(all(packet,'extensions').length,15);
  assert.equal(all(packet,'findings').flatMap(r=>r[2]).length,474);
  assert.equal(packet.coverage.sections.entries.prepared,473);assert.equal(packet.requiredCalls,packet.pages.length+1);
+ assert.equal(packet.coverage.collection.totals.entriesPrepared,473);
+ assert.equal(packet.pages[0].diagnostics.audit.coverage.collection,packet.coverage.collection);
  for(const page of packet.pages){assert.ok(bytes(page)<=AUDIT_PAGE_BYTES);arraysBounded(page);assert.deepEqual(redactDiagnostic(page),page);}
  const text=JSON.stringify(packet);assert.doesNotMatch(text,/PRIVATE_|sk-private|evidence":"PRIVATE/);
  assert.equal(packet.pages[0].diagnostics.audit.globalWorldSettings.world_info_budget_cap,0);
@@ -50,6 +52,7 @@ test('full audit visits each page then synthesis exactly once and can select onl
  const packet=createAuditPacket(report,{plan});let calls=0;const progress=[];
  const result=await runAgentAudit({packet,maxCalls:packet.requiredCalls,canContinue:async()=>true,onProgress:async p=>progress.push(p),callAgent:async payload=>{calls++;assert.deepEqual(redactDiagnostic(payload),payload);assert.ok(bytes(payload)<=AUDIT_PAGE_BYTES);return reply(`检查页 ${calls}`,payload.diagnostics.audit.phase==='synthesis'?[{type:'select_candidate',candidateId:'current-batch'}]:[]);}});
  assert.equal(result.status,'complete');assert.equal(result.reviewedPages,packet.pages.length);assert.equal(calls,packet.requiredCalls);assert.equal(result.selectedCandidateId,'current-batch');assert.equal(progress.at(-1).phase,'complete');
+ assert.equal(Object.hasOwn(result,'failure'),false);
 });
 
 test('model operation injection or invalid response stops without executing or retrying',async()=>{
@@ -81,6 +84,68 @@ test('synthesis retains bounded notes from every paid page and marks shortening 
 test('upstream failure retains reviewed evidence and stops instead of automatically retrying paid work',async()=>{
  const packet=createAuditPacket(fixture());let calls=0;
  const result=await runAgentAudit({packet,maxCalls:99,callAgent:async()=>{calls++;if(calls===2)throw new Error('upstream private response');return reply();}});assert.equal(result.status,'partial');assert.equal(result.reviewedPages,1);assert.equal(calls,2);assert.equal(result.reason,'AUDIT_STOPPED_AFTER_ERROR');assert.doesNotMatch(JSON.stringify(result),/upstream private response/);
+});
+
+test('safe failure metadata distinguishes plugin HTTP status from upstream HTTP status without exposing raw errors',async()=>{
+ const packet=createAuditPacket(fixture(1));let calls=0;
+ const error=Object.assign(new Error('PRIVATE_PROVIDER_BODY sk-secret123456789'),{code:'AGENT_HTTP_400',httpStatus:502,headers:{authorization:'Bearer PRIVATE_KEY'},stack:'PRIVATE_STACK'});
+ const result=await runAgentAudit({packet,maxCalls:99,callAgent:async()=>{calls++;throw error;}});
+ assert.equal(result.reason,'AUDIT_STOPPED_AFTER_ERROR');assert.equal(result.status,'partial');
+ assert.equal(result.reviewedPages,0);assert.equal(result.calls,1);assert.equal(calls,1);
+ assert.deepEqual(result.failure,{code:'AGENT_HTTP_400',stage:'page-call',retryAttempted:false,page:1,httpStatus:502,upstreamHttpStatus:400});
+ assert.doesNotMatch(JSON.stringify(result),/PRIVATE_|sk-secret/);
+});
+
+test('known server proposal, budget and connection failures survive audit export without retries',async()=>{
+ for(const code of ['AGENT_PROPOSAL_NOT_JSON','AGENT_PROPOSAL_INVALID_SCHEMA','AGENT_BUDGET_EXHAUSTED','UPSTREAM_CONNECTION_FAILED','LOCAL_OPERATION_TIMEOUT']){
+  const packet=createAuditPacket(fixture(1));let calls=0;
+  const result=await runAgentAudit({packet,maxCalls:99,callAgent:async()=>{calls++;throw Object.assign(new Error('PRIVATE_RESPONSE'),{code,httpStatus:502});}});
+  assert.equal(result.failure.code,code);assert.equal(result.failure.stage,'page-call');assert.equal(result.failure.page,1);
+  assert.equal(result.failure.retryAttempted,false);assert.equal(calls,1);assert.equal(result.calls,1);assert.equal(result.reviewedPages,0);
+  assert.equal(Object.hasOwn(result.failure,'upstreamHttpStatus'),false);assert.doesNotMatch(JSON.stringify(result),/PRIVATE_RESPONSE/);
+ }
+});
+
+test('post-call freshness failure identifies revalidation rather than claiming the model failed',async()=>{
+ const packet=createAuditPacket(fixture(1));let returned=false,calls=0;
+ const result=await runAgentAudit({packet,maxCalls:99,canContinue:async()=>{
+  if(returned)throw Object.assign(new Error('PRIVATE_WORLD_READ_FAILURE'),{code:'LOCAL_OPERATION_TIMEOUT'});
+  return true;
+ },callAgent:async()=>{calls++;returned=true;return reply();}});
+ assert.equal(result.status,'partial');assert.equal(result.reason,'AUDIT_STOPPED_AFTER_ERROR');
+ assert.equal(calls,1);assert.equal(result.calls,1);assert.equal(result.reviewedPages,0);
+ assert.deepEqual(result.failure,{code:'LOCAL_OPERATION_TIMEOUT',stage:'revalidate-after-page-call',retryAttempted:false,page:1});
+ assert.doesNotMatch(JSON.stringify(result),/PRIVATE_WORLD_READ_FAILURE/);
+});
+
+test('preflight and synthesis failures retain their own stages and only actual attempts are counted',async()=>{
+ const packet=createAuditPacket(fixture(1));let calls=0;
+ const early=await runAgentAudit({packet,maxCalls:99,canContinue:async()=>{throw Object.assign(new Error('private'),{code:'LOCAL_OPERATION_TIMEOUT'});},callAgent:async()=>{calls++;return reply();}});
+ assert.equal(early.calls,0);assert.equal(calls,0);assert.equal(early.failure.stage,'preflight');assert.equal(Object.hasOwn(early.failure,'page'),false);
+ const later=await runAgentAudit({packet,maxCalls:99,callAgent:async payload=>{
+  calls++;
+  if(payload.diagnostics.audit.phase==='synthesis')throw Object.assign(new Error('private'),{code:'AGENT_HTTP_429',httpStatus:502});
+  return reply();
+ }});
+ assert.equal(later.reviewedPages,packet.pages.length);assert.equal(later.calls,packet.requiredCalls);assert.equal(calls,packet.requiredCalls);
+ assert.deepEqual(later.failure,{code:'AGENT_HTTP_429',stage:'synthesis-call',retryAttempted:false,httpStatus:502,upstreamHttpStatus:429});
+});
+
+test('proposal validation failure is separate from transport failure and never selects a candidate',async()=>{
+ const packet=createAuditPacket(fixture(1));let calls=0;
+ const result=await runAgentAudit({packet,maxCalls:99,callAgent:async()=>{calls++;return reply('bad',[{type:'write_file',path:'/PRIVATE_PATH'}]);}});
+ assert.equal(calls,1);assert.equal(result.reason,'UNAUTHORIZED_AUDIT_OPERATION');assert.equal(result.selectedCandidateId,null);
+ assert.deepEqual(result.failure,{code:'UNAUTHORIZED_AUDIT_OPERATION',stage:'page-validate',retryAttempted:false,page:1});
+ assert.doesNotMatch(JSON.stringify(result),/PRIVATE_PATH/);
+});
+
+test('failure sanitizer rejects arbitrary uppercase codes, arbitrary stage fields, malformed statuses and extra data',()=>{
+ const source={code:'PRIVATE_API_KEY_ABCDEF',message:'PRIVATE_WORLD_TEXT',httpStatus:'502',upstreamHttpStatus:401,stack:'PRIVATE_STACK',body:'Bearer PRIVATE_SECRET'};
+ assert.deepEqual(safeAuditFailure(source,{stage:'PRIVATE_STAGE',pageIndex:Infinity}),{code:'AUDIT_UNKNOWN_ERROR',stage:'unknown',retryAttempted:false});
+ assert.deepEqual(safeAuditFailure({code:'AGENT_HTTP_400_PRIVATE_SECRET',httpStatus:600},{stage:'page-call',pageIndex:24}),{code:'AUDIT_UNKNOWN_ERROR',stage:'page-call',retryAttempted:false});
+ assert.deepEqual(safeAuditFailure({code:'AGENT_HTTP_401'},{stage:'history-recovery'}),{code:'AGENT_HTTP_401',stage:'history-recovery',retryAttempted:false,upstreamHttpStatus:401});
+ assert.deepEqual(safeAuditFailure({code:'AGENT_PROPOSAL_NOT_JSON'},{stage:'server-record'}),{code:'AGENT_PROPOSAL_NOT_JSON',stage:'server-record',retryAttempted:false});
+ assert.deepEqual(safeAuditFailure(new Error('INVALID_AUDIT_RESPONSE'),{stage:'page-validate',pageIndex:0}),{code:'INVALID_AUDIT_RESPONSE',stage:'page-validate',retryAttempted:false,page:1});
 });
 
 test('credentials are redacted before optional excerpt clipping and in retained model output',async()=>{

@@ -1,8 +1,41 @@
 /** Bounded paginated audit. No file, native configuration or prompt writes. */
 import { summarizeBatchPlan } from './batch-plan-report.js';
+import { auditCollectionEvidence } from './audit-evidence.js';
 export const AUDIT_VERSION = 1;
 export const AUDIT_PAGE_BYTES = 18000;
 const MAX_ROWS = 80;
+// Only implementation-owned codes cross the export boundary. Raw errors may
+// contain provider responses, source text or credentials, even when uppercase.
+const AUDIT_FAILURE_CODES = new Set([
+ 'AGENT_BUDGET_EXHAUSTED','AGENT_BUSY','AGENT_NOT_ENABLED','AGENT_INTERNAL_ERROR',
+ 'AGENT_PROPOSAL_NOT_JSON','AGENT_PROPOSAL_INVALID_SCHEMA','INVALID_AGENT_RESPONSE',
+ 'INVALID_AGENT_PAYLOAD','DIAGNOSTICS_TOO_LARGE','PAYLOAD_TOO_LARGE',
+ 'AUTHENTICATED_USER_REQUIRED','CACHE_LENS_SERVER_ERROR','INVALID_USER_DIRECTORY',
+ 'SYMLINK_STATE_DIRECTORY_FORBIDDEN','SYMLINK_STATE_FILE_FORBIDDEN',
+ 'INVALID_ENDPOINT','ENDPOINT_CREDENTIALS_OR_QUERY_FORBIDDEN','HTTPS_REQUIRED',
+ 'LOCAL_ENDPOINT_NOT_ENABLED','PRIVATE_ENDPOINT_FORBIDDEN','RESPONSE_TOO_LARGE',
+ 'UPSTREAM_CONNECTION_FAILED','UPSTREAM_DNS_FAILED','UPSTREAM_TIMEOUT','UPSTREAM_REDIRECT_FORBIDDEN',
+ 'PROXY_URL_INVALID','PROXY_LOOPBACK_REQUIRED','PROXY_OPENAI_ONLY','PROXY_CONNECTION_FAILED',
+ 'PROXY_AUTH_REQUIRED','PROXY_CONNECT_REJECTED','PROXY_TLS_FAILED','PROXY_TIMEOUT','PROXY_ABORTED',
+ 'LOCAL_OPERATION_TIMEOUT','LOCAL_OPERATION_ABORTED','CLIENT_NETWORK_ERROR','SERVER_RESPONSE_INVALID_JSON',
+ 'INVALID_AUDIT_RESPONSE','UNAUTHORIZED_AUDIT_OPERATION','AUDIT_SYNTHESIS_TOO_LARGE',
+]);
+const AUDIT_FAILURE_STAGES = new Set([
+ 'preflight','revalidate-before-page-call','progress-page','page-call',
+ 'revalidate-after-page-call','page-validate','revalidate-before-synthesis-call',
+ 'progress-synthesis','synthesis-build','synthesis-call','revalidate-after-synthesis-call',
+ 'synthesis-validate','revalidate-completion','progress-complete','collection','history-recovery','server-record',
+]);
+/** Bounded diagnostics only; never retain a raw message, stack, endpoint or body. */
+export function safeAuditFailure(error, { stage, pageIndex } = {}) {
+ const known = value => typeof value === 'string' && (AUDIT_FAILURE_CODES.has(value) || /^AGENT_HTTP_[45]\d{2}$/.test(value));
+ const code = known(error?.code) ? error.code : known(error?.message) ? error.message : 'AUDIT_UNKNOWN_ERROR';
+ const result = { code, stage: AUDIT_FAILURE_STAGES.has(stage) ? stage : 'unknown', retryAttempted: false };
+ if (Number.isSafeInteger(pageIndex) && pageIndex >= 0 && pageIndex < 24) result.page = pageIndex + 1;
+ if (Number.isSafeInteger(error?.httpStatus) && error.httpStatus >= 100 && error.httpStatus <= 599) result.httpStatus = error.httpStatus;
+ if (/^AGENT_HTTP_[45]\d{2}$/.test(code)) result.upstreamHttpStatus = Number(code.slice('AGENT_HTTP_'.length));
+ return result;
+}
 const rows = v => Array.isArray(v) ? v : [];
 const number = v => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
 const integer = v => Number.isSafeInteger(v) && v >= 0 ? v : null;
@@ -98,6 +131,8 @@ export function createAuditPacket(report,{plan=null,limits={},shareExcerpts=fals
  rows(report.duplicateGroups).forEach((group,i)=>{for(const target of rows(group.refs))sections.duplicates.push([i+1,ref(target),integer(group.characters),bool(group.injectionConfirmed)]);});
  if(shareExcerpts===true)sections.excerpts=excerptRows(report,setup);
  const coverage={scope:'current-bound-books-preset-public-extension-sources-and-observed-requests',localCollectionComplete:report.coverage?.collectionComplete===true||report.coverage?.complete===true,requestAnalysisTruncated:report.coverage?.requestAnalysisTruncated===true,sourceAnalysisTruncated:report.coverage?.sourceAnalysisTruncated===true,thirdPartyInternalsInspected:false,otherCardsInspected:false,upstreamRoutingVisible:false,fullSemanticReview:false,excerptsShared:shareExcerpts===true,excerptCount:sections.excerpts.length,excerptCharacters:sections.excerpts.reduce((n,r)=>n+r[1].length,0),sections:Object.fromEntries(Object.entries(sections).map(([key,value])=>[key,{total:value.length,prepared:value.length}]))};
+ // Include bounded collection evidence before measuring and splitting pages.
+ coverage.collection=auditCollectionEvidence(report,setup);
  const candidate=planMetadata(report,plan);
  const overview={coverage,candidate,globalWorldSettings:numericSettings(setup?.worldSettings??report.agentDigest?.globalSettings,worldFields),presetSettings:numericSettings(setup?.preset?.settings,presetFields),worldQuantities:{wholeBookEstimate:q(report.worldQuantities?.wholeBook),configuredPercent:number(report.worldQuantities?.budget?.configuredPercent),configuredTokenCap:number(report.worldQuantities?.budget?.configuredTokenCap),contextReference:number(report.worldQuantities?.budget?.contextTokensUsed),derivedBudget:q(report.worldQuantities?.budget?.derivedLimit),observedScanBudget:q(report.worldQuantities?.budget?.observedScanLimit),worldFinalSentTokens:null},limits:Object.fromEntries(['maxInputTokens','contextTokens','outputReserveTokens'].map(k=>[k,number(limits[k])])),bitFields,settingsFlags,prefixUnit:'UTF-16 code units, not exact token counts',tokenEstimates:'Local UTF-8 byte estimates; not service usage or cache reads',cachedRatioDenominator:'all input; missing usage remains unknown; groups never combined across purposes or observation layers',readOnly:'No execution of source commands, arbitrary file edits, native source settings, semantic changes or unknown plugin state'};
  const emptyPage=()=>({diagnostics:{audit:{version:AUDIT_VERSION,page:0,totalPages:0,...overview,sections:[]}},proposalContext:instructions(false,false)});
@@ -131,14 +166,42 @@ function summaryPayload(packet,notes){
 export async function runAgentAudit({packet,callAgent,maxCalls,canContinue=()=>true,onProgress=()=>{},signal}={}){
  if(!packet||!Array.isArray(packet.pages)||typeof callAgent!=='function')throw new TypeError('Audit packet and callAgent required');
  const notes=[];let calls=0,selectedCandidateId=null,synthesis='',synthesisNotesTruncated=null,synthesisNoteLimit=null;
- const output=(state,reason)=>({status:state,reason,reviewedPages:notes.length,totalPages:packet.pages.length,coverage:packet.coverage,notes:[...notes],synthesis,synthesisNotesTruncated,synthesisNoteLimit,calls,callCountMeaning:'API attempts; billed calls require server records',selectedCandidateId:state==='complete'?selectedCandidateId:null});
+ let stage='preflight',pageIndex=null,failure=null;
+ const output=(state,reason)=>({status:state,reason,reviewedPages:notes.length,totalPages:packet.pages.length,coverage:packet.coverage,notes:[...notes],synthesis,synthesisNotesTruncated,synthesisNoteLimit,calls,callCountMeaning:'API attempts; billed calls require server records',selectedCandidateId:state==='complete'?selectedCandidateId:null,...(failure?{failure}:{})});
  const permitted=async()=>{if(signal?.aborted)return false;const value=await canContinue();return !signal?.aborted&&value!==false&&value?.ok!==false;};
+ const permittedAt=async nextStage=>{stage=nextStage;return await permitted();};
  if(packet.tooManyPages)return output('blocked','AUDIT_SCOPE_REQUIRES_TOO_MANY_CALLS');
  if(!Number.isSafeInteger(maxCalls)||maxCalls<packet.requiredCalls)return output('blocked','INSUFFICIENT_CALL_BUDGET');
- async function progress(phase){if(!await permitted())return false;await onProgress({phase,reviewedPages:notes.length,totalPages:packet.pages.length,calls,requiredCalls:packet.requiredCalls});return await permitted();}
+ async function progress(phase){
+  const before=phase==='page'?'revalidate-before-page-call':phase==='synthesis'?'revalidate-before-synthesis-call':'revalidate-completion';
+  if(!await permittedAt(before))return false;
+  stage=`progress-${phase}`;await onProgress({phase,reviewedPages:notes.length,totalPages:packet.pages.length,calls,requiredCalls:packet.requiredCalls});
+  return await permittedAt(before);
+ }
  try{
-  if(!await permitted())return output('cancelled','AUDIT_CANCELLED_OR_STALE');
-  for(const page of packet.pages){if(!await progress('page'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');if(!await permitted())return output('cancelled','AUDIT_CANCELLED_OR_STALE');calls++;const result=await callAgent(page);const stillCurrent=await permitted();notes.push(validProposal(result,false,packet.candidate).reason);if(!stillCurrent)return output('cancelled','AUDIT_CANCELLED_OR_STALE');}
-  if(!await progress('synthesis'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');const payload=summaryPayload(packet,notes);synthesisNotesTruncated=payload.diagnostics.audit.notesTruncated;synthesisNoteLimit=payload.diagnostics.audit.noteLimit;if(!await permitted())return output('cancelled','AUDIT_CANCELLED_OR_STALE');calls++;const result=await callAgent(payload);const stillCurrent=await permitted();const valid=validProposal(result,true,packet.candidate);synthesis=valid.reason;if(!stillCurrent)return output('cancelled','AUDIT_CANCELLED_OR_STALE');selectedCandidateId=valid.selectedCandidateId;if(!await progress('complete'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');return output('complete','ALL_PREPARED_METADATA_PAGES_REVIEWED');
- }catch(error){return output(signal?.aborted?'cancelled':'partial',['INVALID_AUDIT_RESPONSE','UNAUTHORIZED_AUDIT_OPERATION','AUDIT_SYNTHESIS_TOO_LARGE'].includes(error?.message)?error.message:'AUDIT_STOPPED_AFTER_ERROR');}
+  if(!await permittedAt('preflight'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+  for(const [index,page] of packet.pages.entries()){
+   pageIndex=index;
+   if(!await progress('page'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+   if(!await permittedAt('revalidate-before-page-call'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+   calls++;stage='page-call';const result=await callAgent(page);
+   const stillCurrent=await permittedAt('revalidate-after-page-call');
+   stage='page-validate';notes.push(validProposal(result,false,packet.candidate).reason);
+   if(!stillCurrent)return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+  }
+  pageIndex=null;
+  if(!await progress('synthesis'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+  stage='synthesis-build';const payload=summaryPayload(packet,notes);synthesisNotesTruncated=payload.diagnostics.audit.notesTruncated;synthesisNoteLimit=payload.diagnostics.audit.noteLimit;
+  if(!await permittedAt('revalidate-before-synthesis-call'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+  calls++;stage='synthesis-call';const result=await callAgent(payload);
+  const stillCurrent=await permittedAt('revalidate-after-synthesis-call');
+  stage='synthesis-validate';const valid=validProposal(result,true,packet.candidate);synthesis=valid.reason;
+  if(!stillCurrent)return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+  selectedCandidateId=valid.selectedCandidateId;
+  if(!await progress('complete'))return output('cancelled','AUDIT_CANCELLED_OR_STALE');
+  return output('complete','ALL_PREPARED_METADATA_PAGES_REVIEWED');
+ }catch(error){
+  failure=safeAuditFailure(error,{stage,pageIndex});
+  return output(signal?.aborted?'cancelled':'partial',['INVALID_AUDIT_RESPONSE','UNAUTHORIZED_AUDIT_OPERATION','AUDIT_SYNTHESIS_TOO_LARGE'].includes(failure.code)?failure.code:'AUDIT_STOPPED_AFTER_ERROR');
+ }
 }

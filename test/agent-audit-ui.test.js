@@ -31,7 +31,7 @@ function response(payload, i, operations = []) {
     return { proposal: { expectedVersion: payload.proposalContext.expectedVersion, reason: '已检查设置；真实服务端缓存仍需实际证据。', operations }, record: { id: `audit-paid-${i}`, model: 'synthetic-agent', provider: 'openai', interfaceType: 'openai', time: '2026-11-13T08:05:00.000Z', status: 'completed', usage: { prompt_tokens: 20, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 0 } }, prices, actualCost: 0.00003 } };
 }
 let serial = 0;
-async function harness({ budget = true, agentReply, collector } = {}) {
+async function harness({ budget = true, agentReply, collector, agentError = null, agentRecords = [], historyError = false, invalidAgentJSON = false } = {}) {
     const f = fixture(), dom = new JSDOM('<div id="extensions_settings2"></div>', { url: 'http://localhost:8000' });
     const descriptors = {}, fetches = [], paid = [], locks = { request: async (_name, options, callback) => (callback || options)() };
     const globals = { document: dom.window.document, window: dom.window, localStorage: dom.window.localStorage, navigator: { locks },
@@ -41,9 +41,14 @@ async function harness({ budget = true, agentReply, collector } = {}) {
             const route = String(url).split('/').at(-1);
             let result;
             if (route === 'status') result = structuredClone(server);
-            else if (route === 'agent-records') result = { records: [] };
+            else if (route === 'agent-records') {
+                if(historyError)return {ok:false,status:503,json:async()=>({error:'ARBITRARY_PRIVATE_SERVER_TEXT'})};
+                result = { records: agentRecords };
+            }
             else if (route === 'agent') {
                 const payload = JSON.parse(options.body); paid.push(payload);
+                if(invalidAgentJSON)return {ok:true,status:200,json:async()=>{throw new Error('synthetic private response body');}};
+                if(agentError)return {ok:false,status:502,json:async()=>({error:agentError})};
                 result = agentReply ? await agentReply(payload, paid.length) : response(payload, paid.length);
             } else throw new Error(`Unexpected network operation: ${route}`);
             return { ok: true, status: 200, json: async () => structuredClone(result) };
@@ -65,6 +70,93 @@ async function harness({ budget = true, agentReply, collector } = {}) {
         async close() { panel.dispose(); await panel.flushObservations(); dom.window.close(); for (const [key, descriptor] of Object.entries(descriptors)) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; } },
     };
 }
+
+test('missing selected character stops full audit before paid calls and exports collection cause', async () => {
+    const h=await harness();
+    try{
+        h.mutateSetup(setup=>{
+            setup.character=null;setup.binding.characterId=null;setup.books=[];setup.complete=false;
+            setup.counts={booksExpected:0,booksLoaded:0,books:0,entries:0};
+            setup.coverageUnknown=['CURRENT_CHARACTER_UNSELECTED'];
+            setup.warnings=[{code:'CURRENT_CHARACTER_UNSELECTED',privateName:'synthetic-private-name'}];
+            setup.preset.prompts=Array.from({length:87},(_,i)=>({identifier:`p-${i}`,content:'synthetic private preset',enabled:true}));
+        });
+        h.click('batch-agent');await h.done();
+        const result=h.panel.getAgentAudit();
+        assert.equal(result.reason,'AUDIT_COLLECTION_INCOMPLETE');assert.equal(result.calls,0);
+        assert.equal(result.coverage.collection.currentCharacterSelected,false);
+        assert.equal(result.coverage.collection.totals.presetsPrepared,87);
+        assert.ok(result.collectionIssues.includes('CURRENT_CHARACTER_UNSELECTED'));
+        assert.equal(h.fetches.length,0);assert.equal(h.paid.length,0);
+        assert.equal(h.q('[data-action="audit-export"]').hidden,false);
+        assert.match(h.q('[data-id="auditResult"]').textContent,/先打开要检查的角色聊天/);
+        assert.doesNotMatch(JSON.stringify(result),/synthetic-private-name|synthetic private preset/);
+    }finally{await h.close();}
+});
+
+test('unknown world bindings stop paid audit without guessing no books are bound', async()=>{
+    const h=await harness();
+    try{
+        h.mutateSetup(setup=>{setup.books=[];setup.counts={booksExpected:0,booksLoaded:0};setup.complete=false;setup.coverageUnknown=['GLOBAL_BINDINGS_UNKNOWN'];setup.warnings=[{code:'WORLD_MODULE_UNAVAILABLE'}];});
+        h.click('batch-agent');await h.done();
+        assert.equal(h.paid.length,0);assert.equal(h.fetches.length,0);
+        assert.ok(h.panel.getAgentAudit().collectionIssues.includes('WORLD_MODULE_UNAVAILABLE'));
+        assert.match(h.q('[data-id="auditResult"]').textContent,/公开接口未能加载/);
+    }finally{await h.close();}
+});
+
+test('paid audit exports bounded server error and stage, with no automatic retry',async()=>{
+    const h=await harness({agentError:'AGENT_HTTP_400'});
+    try{
+        h.click('batch-agent');await h.done();
+        const result=h.panel.getAgentAudit();
+        assert.equal(result.status,'partial');assert.equal(result.reviewedPages,0);assert.equal(result.calls,1);
+        assert.equal(result.failure.code,'AGENT_HTTP_400');assert.equal(result.failure.httpStatus,502);assert.equal(result.failure.upstreamHttpStatus,400);
+        assert.equal(result.failure.stage,'page-call');assert.equal(result.failure.page,1);
+        assert.equal(h.paid.length,1);assert.match(h.q('[data-id="auditResult"]').textContent,/AGENT_HTTP_400/);
+        assert.doesNotMatch(h.q('[data-id="auditProgress"]').textContent,/已发生调用仍计费/);
+    }finally{await h.close();}
+});
+
+test('free recovery reads existing failures with zero budget and never correlates them to the audit',async()=>{
+    const h=await harness({budget:false,agentRecords:[{id:'baf91b50-8683-4c41-8a4d-6cd07bb99661',time:'2026-11-13T08:05:00.000Z',status:'failed',error:'AGENT_PROPOSAL_NOT_JSON',apiKey:'synthetic-private-key',body:'synthetic private story',model:'synthetic-private-model',actualCost:0.0002,reservedCost:0.03,currency:'USD',spendGuard:'usage-priced',usage:{prompt_tokens:20,completion_tokens:10}}]});
+    try{
+        h.click('audit-recover');await waitFor(()=>!h.q('[data-action="audit-recover"]').disabled,'free recovery completion');
+        const result=h.panel.getAgentAudit();
+        assert.equal(result.status,'diagnostic-only');assert.equal(result.recovery.modelCallsMade,0);
+        assert.equal(result.recovery.history.correlatedToAudit,false);
+        assert.equal(result.recovery.history.recentFailures[0].failure.code,'AGENT_PROPOSAL_NOT_JSON');
+        assert.equal(h.paid.length,0);
+        assert.deepEqual(h.fetches.map(f=>f.url.split('/').at(-1)).sort(),['agent-records','status']);
+        assert.ok(h.fetches.every(f=>f.options.method==='GET'));
+        assert.doesNotMatch(JSON.stringify(result),/synthetic-private-key|synthetic private story|synthetic-private-model/);
+        assert.match(h.q('[data-id="auditResult"]').textContent,/JSON/);
+        assert.equal(h.q('[data-action="audit-export"]').hidden,false);
+    }finally{await h.close();}
+});
+
+test('free recovery keeps local evidence exportable when server history is unavailable',async()=>{
+    const h=await harness({budget:false,historyError:true});
+    try{
+        h.click('audit-recover');await waitFor(()=>!h.q('[data-action="audit-recover"]').disabled,'failed history read');
+        const result=h.panel.getAgentAudit();
+        assert.ok(result.recovery.collection);assert.equal(result.recovery.history,null);
+        assert.equal(result.recovery.historyFailure.code,'AUDIT_UNKNOWN_ERROR');assert.equal(result.recovery.historyFailure.httpStatus,503);
+        assert.equal(h.paid.length,0);assert.equal(result.recovery.modelCallsMade,0);
+        assert.doesNotMatch(JSON.stringify(result),/ARBITRARY_PRIVATE_SERVER_TEXT/);
+    }finally{await h.close();}
+});
+
+test('browser network and invalid service JSON failures export distinct safe codes without raw text',async()=>{
+    for(const [options,code] of [[{agentReply:async()=>{throw new TypeError('synthetic private endpoint/key');}},'CLIENT_NETWORK_ERROR'],[{invalidAgentJSON:true},'SERVER_RESPONSE_INVALID_JSON']]){
+        const h=await harness(options);
+        try{
+            h.click('batch-agent');await h.done();const result=h.panel.getAgentAudit();
+            assert.equal(result.failure.code,code);assert.equal(result.failure.stage,'page-call');assert.equal(result.calls,1);
+            assert.equal(h.paid.length,1);assert.doesNotMatch(JSON.stringify(result),/synthetic private/);
+        }finally{await h.close();}
+    }
+});
 
 test('one-click audit collects current configuration before refusing zero budget without any network', async () => {
     const h = await harness({ budget: false });

@@ -28,6 +28,15 @@ export function isPublicAddress(address) {
     return false;
 }
 
+// Clash/Mihomo can resolve public names into this common Fake-IP pool and
+// intercept the normal OS connection. This is not a globally public range:
+// only a DNS answer for the exact official HTTPS origin gets this exception.
+function isOfficialOpenAIFakeIp(url, address) {
+    if (url.origin !== 'https://api.openai.com' || net.isIP(address) !== 4) return false;
+    const [a, b] = address.split('.').map(Number);
+    return a === 198 && (b === 18 || b === 19);
+}
+
 export function validateEndpoint(value, { allowLocal = false } = {}) {
     let url;
     try { url = new URL(value); } catch { throw new ServiceError('INVALID_ENDPOINT'); }
@@ -183,13 +192,26 @@ export async function openUpstream(value, { method = 'POST', headers = {}, body,
     let addresses;
     try { addresses = net.isIP(hostname) ? [{ address: hostname, family: net.isIP(hostname) }] : await dns.lookup(hostname, { all: true }); }
     catch { throw new ServiceError('UPSTREAM_DNS_FAILED', 502); }
-    if (!addresses.length || addresses.some(({address}) => !isPublicAddress(address) && !(allowLocal && isLoopback(hostname) && isLoopback(address)))) {
+    if (!addresses.length || addresses.some(({address}) => !isPublicAddress(address)
+        && !isOfficialOpenAIFakeIp(url, address)
+        && !(allowLocal && isLoopback(hostname) && isLoopback(address)))) {
         throw new ServiceError('PRIVATE_ENDPOINT_FORBIDDEN');
     }
     const selected = addresses[0];
+    const officialOpenAI = url.origin === 'https://api.openai.com';
+    const requestHeaders = officialOpenAI ? { ...headers } : headers;
+    if (officialOpenAI) {
+        // A caller-supplied Host must not change the identity authenticated by
+        // TLS, including when a Fake-IP address is routed through the OS/TUN.
+        for (const key of Object.keys(requestHeaders)) {
+            if (key.toLowerCase() === 'host') delete requestHeaders[key];
+        }
+        requestHeaders.Host = 'api.openai.com';
+    }
     return await new Promise((resolve, reject) => {
         const request = (url.protocol === 'https:' ? https : http).request(url, {
-            method, headers, signal, agent: false,
+            method, headers: requestHeaders, signal, agent: false, rejectUnauthorized: true,
+            ...(officialOpenAI ? { servername: 'api.openai.com' } : {}),
             lookup: (_name, options, callback) => options?.all ? callback(null, [selected]) : callback(null, selected.address, selected.family),
         }, response => {
             if (response.statusCode >= 300 && response.statusCode < 400) {

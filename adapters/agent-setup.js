@@ -25,7 +25,7 @@ export function agentSetupError(code, status) {
     AGENT_CHECK_RATE_LIMIT: '连接检查过于频繁，请一分钟后再试。',
     AGENT_CHECK_TIMEOUT: '连接检查超时，请检查酒馆服务器能否访问接口地址。',
     INVALID_ENDPOINT: '接口地址格式无效，请填写包含 https:// 的完整地址。',
-    PRIVATE_ENDPOINT_FORBIDDEN: '接口地址或其 DNS 结果落在受保护的非公网范围；Clash Fake-IP 可能触发此检查。使用 OpenAI 官方接口时，可启用本机 Clash 代理并填写实际 HTTP / Mixed 端口，无需关闭 Fake-IP。',
+    PRIVATE_ENDPOINT_FORBIDDEN: '插件在发送前拦截了接口的非公网目标地址；这不是你的公网出口 IP。官方 OpenAI 的常见 Fake-IP 范围由 0.1.9 服务端兼容，请先核对服务端版本；其他解析范围仍需检查，不能仅凭此错误确定原因。无需关闭 Fake-IP。',
     AGENT_PROXY_SERVER_UPDATE_REQUIRED: '当前服务端尚不支持 Clash 代理。请更新前端后执行本栏服务端安装命令，再重启酒馆；仅刷新页面不够。',
     PROXY_URL_INVALID: '请填写完整本机代理地址，例如 http://127.0.0.1:实际端口，把“实际端口”替换为 Clash 的 HTTP / Mixed 端口数字；不支持代理用户名或密码。',
     PROXY_LOOPBACK_REQUIRED: '代理地址只允许本机 127.0.0.1 或 [::1]；请填写 Clash 的本机 HTTP / Mixed 端口。',

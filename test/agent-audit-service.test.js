@@ -72,7 +72,7 @@ test('full paginated audit survives the server transport without losing metadata
             choices: [{ message: { content: JSON.stringify({ expectedVersion: 1, reason: final ? '综合检查完成；只选择本地候选。' : '已检查本页；尚无上游缓存证据。',
                 operations: final ? [{ type: 'select_candidate', candidateId: 'current-batch' }] : [] }) } }] }));
     });
-    assert.equal(SERVER_VERSION, '0.1.8');
+    assert.equal(SERVER_VERSION, '0.1.9');
     const result = await runAgentAudit({ packet, maxCalls: 40, canContinue: async () => true,
         callAgent: async payload => { const reply = await service.run(payload); billed.push(reply.record); return reply; } });
     assert.equal(result.status, 'complete', result.reason);

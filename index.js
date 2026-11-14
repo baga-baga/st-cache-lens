@@ -54,7 +54,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.8</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.9</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
@@ -125,9 +125,12 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       <label class="cl-wide">模型<input data-id="agentModel" placeholder="例如 gpt-6.1-terra" spellcheck="false"></label>
       <label class="cl-wide">API 密钥<input data-id="agentKey" type="password" autocomplete="off" placeholder="只在这里填写；留空保留同地址已保存密钥"></label>
     </div>
+    <p class="cl-note">通常填写 API 地址、模型和密钥即可，沿用酒馆所在设备的网络。0.1.9 服务端兼容 OpenAI 官方地址的常见 Fake-IP 范围，无需填写代理端口或关闭 Fake-IP。</p>
+    <details data-id="agentProxyDetails"><summary>可选：手动指定本机代理</summary>
     <label><input data-id="agentProxyEnabled" type="checkbox">通过本机 Clash 代理连接 OpenAI（保留 Fake-IP）</label>
     <label>Clash HTTP / Mixed 代理地址<input data-id="agentProxyURL" type="url" placeholder="http://127.0.0.1:实际端口" spellcheck="false"></label>
     <p class="cl-note">填写 Clash 中实际的 HTTP 或 Mixed（混合）端口，不是 SOCKS 单独端口或控制面板端口。API 地址仍填 OpenAI 原地址。此选项仅作用于优化 Agent 的 OpenAI 官方请求，Fake-IP 和酒馆正文连接保持原设置。</p>
+    </details>
     <p class="cl-note">密钥只发送给同源酒馆服务端，不写进前端设置或导出。检查连接只读取模型信息，不发送剧情、不生成内容；不能据此保证余额充足或生成成功。</p>
     <button data-action="check-agent">3. 检查连接与模型（不生成）</button>
     <div class="cl-grid">
@@ -406,7 +409,8 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
         $(root,'[data-id="agentLocal"]').checked=c.allowLocal===true;
       }
       if(!agentProxyEdited&&value('agentEndpoint').trim()===c.endpoint){set('agentProxyURL',c.proxyUrl||'');$(root,'[data-id="agentProxyEnabled"]').checked=Boolean(c.proxyUrl);}
-      out('agentStatus','服务端已有配置：'+c.model+'；密钥已保存在服务端。');
+      if(c.proxyUrl&&!agentProxyEdited)$(root,'[data-id="agentProxyDetails"]').open=true;
+      out('agentStatus','服务端已有配置：'+c.model+'；密钥已保存在服务端。已保存连接方式：'+(c.proxyUrl?'手动本机代理。':'沿用设备网络。'));
     }
     return serverStatus;
   }
@@ -556,7 +560,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       out('agentConnection','已填写 OpenAI 官方接口、gpt-6.1-terra 和价格快照。请填写 OpenAI API 密钥，再检查连接。预算未改变，尚未保存。');
     },
     async 'check-agent'(){
-      try{await checkAgentServer();out('agentConnection','正在检查密钥与模型可见性，不生成内容……');const result=await api('agent-check',agentConnectionInput());if(!result.ok||result.modelVisible!==true)throw new Error(agentSetupError(result.code,result.httpStatus));out('agentConnection','连接检查通过：'+(result.authenticationVerified===true?'密钥被接受，':'接口可访问（未确认此兼容接口是否校验密钥），')+'模型 '+result.model+' 可见。尚未进行生成或余额验证；现在可填写预算并保存。');}
+      try{await checkAgentServer();const draft=agentConnectionInput();const route=draft.proxyUrl?'手动本机代理':'沿用设备网络';out('agentConnection','正在检查密钥与模型可见性（'+route+'），不生成内容……');const result=await api('agent-check',draft);if(!result.ok||result.modelVisible!==true)throw new Error(agentSetupError(result.code,result.httpStatus));out('agentConnection','连接检查通过：'+(result.authenticationVerified===true?'密钥被接受，':'接口可访问（未确认此兼容接口是否校验密钥），')+'模型 '+result.model+' 可见。连接方式：'+route+'。尚未进行生成或余额验证；现在可填写预算并保存。');}
       catch(error){out('agentConnection',error.message);throw error;}
     },
     async 'save-agent'(){

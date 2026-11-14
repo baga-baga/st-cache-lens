@@ -28,7 +28,8 @@
 | Windows / macOS / Linux | Node 安装脚本使用跨平台路径；不依赖 Bash | 用户电脑、杀毒软件、实际目录权限 |
 | SillyTavern 1.19.0 | 官方源码接口核验；本地适配与回放测试 | 用户安装及所有现有扩展组合 |
 | Anthropic Messages | 观察最终 `system/messages`、合法 `cache_control` 结构及 usage | 用户中转是否保留字段、是否转路由、缓存隔离/TTL、实际账单 |
-| OpenAI 官方 + Clash HTTP / Mixed | 0.1.8 服务端显式支持回环 HTTP CONNECT；目标仅限 `https://api.openai.com`，保留目标 TLS 验证；Fake-IP 与全局 DNS 无需修改 | 用户实际 Clash 端口、Android / Termux 联通性、真实 OpenAI 账号与付费生成 |
+| OpenAI 官方 + 现有 Clash / VPN | 0.1.9 默认允许官方 HTTPS 443 目标的 DNS 返回 `198.18.0.0/15`；DNS 结果固定、证书链和域名验证保留，无需手填代理端口 | 现有 TUN / VPN 是否接管连接、Android / Termux 联通性；自定义 Fake-IP 范围和 IPv6 Fake-IP 未覆盖 |
+| OpenAI 官方 + 可选 HTTP / Mixed | 0.1.8 起可显式使用回环 HTTP CONNECT；仍是可选高级模式，保留目标 TLS 验证 | 用户实际代理端口、真实 OpenAI 账号与付费生成 |
 | OpenAI 兼容接口 | 区分兼容协议与厂商语义；归一化已知 usage 字段；默认不注入 Anthropic 字段 | 中转非标准计费、字段别名、GPT 新旧缓存选项支持 |
 | DeepSeek 摘要 | 独立用途/模型统计，支持官方缓存 hit/miss 字段 | 摘要插件实际走哪条调用路径；第三方独立请求需要适配器或请求导入 |
 | 酒馆助手、类脑缓存插件、用户自动摘要插件 | 已公开来源快照/显式适配器；未确认实现时只读 | 准确仓库、版本、设置导出；没有宣称已支持它们的内部写入 |
@@ -55,12 +56,16 @@
 
 手动恢复插件程序时，先停止酒馆，把当前 Cache Lens 目录移走，再将安装日志中的备份目录移回对应位置。程序安装备份与界面里的“优化方案回滚”是两种独立机制。
 
-## 0.1.8 本机代理边界
+## 0.1.9 默认 Fake-IP 兼容范围
 
-服务端 `agentProxy: true` 表示支持新的显式 Agent 代理配置。只更新前端不能使旧服务端获得联网能力；要使用此功能，先更新扩展、停止酒馆，再在酒馆根目录运行 `node data/default-user/extensions/st-cache-lens/scripts/install.mjs --st . --server`，最后重启。已有 `enableServerPlugins: true` 无需重复修改。0.1.1 服务端可继续提供原有不使用此代理的功能。
+此次修复在服务端联网代码中。更新扩展并停止酒馆后，在酒馆根目录运行 `node data/default-user/extensions/st-cache-lens/scripts/install.mjs --st . --server`，再重启。已有 `enableServerPlugins: true` 无需重复修改。旧服务端仍可使用原有功能，但缺少本次修复。
 
-代理入口仅允许带明确端口的 HTTP 回环地址 `127.0.0.1` 或 `::1`；`localhost` 固定转换为 `127.0.0.1`，不通过 DNS 发现代理。禁止认证信息、查询、片段或额外路径。代理目标固定在官方 OpenAI HTTPS origin，CONNECT 中传递目标主机名；密钥与请求正文只在随后通过严格证书和主机名校验的 TLS 连接中发送。代理失败不直接回退到公网请求，重定向也不跟随。
+默认 HTTPS 路径仅为精确的 `https://api.openai.com:443` 放行 DNS 返回的 `198.18.0.0/15`。此规则位于共用出站连接函数，按目标接口判定：优化 Agent 与上游恰为该官方地址的 relay 均适用；Claude、DeepSeek 等其他域名不变。连接固定到本次检查得到的地址，TLS 证书链与域名校验仍是必需条件；不能换成任意私有地址、其他域名或端口，其他目标的地址保护不变。源码中的地址检查发生在 API 请求发出前，不是查询或验证用户的公网出口 IP。没有实际 DNS 结果时，不把 `PRIVATE_ENDPOINT_FORBIDDEN` 唯一归因于 Fake-IP。
 
-该路径只覆盖优化 Agent 的模型查询和预算受控生成。它不改变正文、摘要、relay 或其他扩展的网络路径，不读取/修改 Clash 配置，不宣称能控制 Clash 最终路由或防止设备上其他软件的网络泄露。原直接连接的 DNS 地址检查保留。HTTP 和 Mixed 端口说明依据 [Mihomo 官方文档](https://wiki.metacubex.one/config/inbound/port/)；不支持 SOCKS-only、控制器端口或需要代理认证的入口。
+正常使用只填写官方 API 地址、模型和密钥，无需手填代理端口。请求依赖已经配置好的 Clash TUN / VPN 等接管 Fake-IP 连接；插件不会修改 DNS、Clash 路由或运行系统代理。自定义 Fake-IP 范围和 IPv6 Fake-IP 暂未覆盖。用户 Android / Termux / Clash 和真实 OpenAI 付费接口仍待接入验证，本地测试不证明实际缓存或费用改善。
 
-验证范围为本地模拟 HTTP CONNECT 与 TLS 服务，以及配置、预算、错误和前端流程测试；用户手机与真实 Clash/OpenAI 连接尚待接入验证。测试中没有真实付费调用，也不能据此判断 Claude 缓存或连续会话费用已改善。
+## 可选手动 HTTP 代理（0.1.8 起）
+
+手动代理在 **“可选：手动指定本机代理”** 中，默认关闭，已有保存选择保留；用户可以取消勾选并保存。服务端 `agentProxy: true` 表示支持此功能。入口只允许带明确端口的 HTTP 回环地址 `127.0.0.1` 或 `::1`；`localhost` 固定转换为 `127.0.0.1`。禁止认证信息、查询、片段或额外路径。
+
+代理目标固定在官方 OpenAI HTTPS origin；CONNECT 传递目标主机名，密钥与正文只在随后通过严格证书链和主机名校验的 TLS 连接中发送。代理失败不自动回退，不跟随重定向。这条可选路径只覆盖优化 Agent，不改变正文、摘要、relay 或其他扩展的网络路径。HTTP / Mixed 说明依据 [Mihomo 官方文档](https://wiki.metacubex.one/config/inbound/port/)；不支持 SOCKS-only、控制器端口或需要代理认证的入口。

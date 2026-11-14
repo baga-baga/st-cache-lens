@@ -25,6 +25,7 @@ test('explicit local proxy persists without exposing keys or resetting spend; om
     const official = { ...config, endpoint: 'https://api.openai.com/v1/chat/completions', allowLocal: false, proxyUrl: 'http://localhost:7892' };
     const status = await service.configure(official);
     assert.equal(status.capabilities.agentProxy, true);
+    assert.equal(status.capabilities.openaiFakeIp, true);
     assert.equal(status.config.proxyUrl, 'http://127.0.0.1:7892/');
     assert.doesNotMatch(JSON.stringify(status), /sk-test-secret/);
     service.state.ledger = { calls: 2, chargedOrReserved: 0.12, currency: 'USD' };
@@ -276,7 +277,7 @@ test('unsaved Agent check sends only GET model query, uploads no diagnostic and 
     const after = await service.status();
     assert.deepEqual(after.ledger, before.ledger); assert.equal(after.configured, false); assert.deepEqual(service.state.records, []);
     await assert.rejects(fs.access(path.join(directory, '.cache-lens/server-state.json')), { code: 'ENOENT' });
-    assert.equal(after.serverVersion, '0.1.8'); assert.equal(after.capabilities.agentCheck, true);
+    assert.equal(after.serverVersion, '0.1.9'); assert.equal(after.capabilities.agentCheck, true);
     assert.deepEqual(after.capabilities.agentCheckInterfaces, ['openai']);
 });
 

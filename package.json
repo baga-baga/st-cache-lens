@@ -1,6 +1,6 @@
 {
   "name": "sillytavern-cache-lens",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "type": "module",
   "description": "Evidence-based request diagnostics and bounded optimization for SillyTavern",

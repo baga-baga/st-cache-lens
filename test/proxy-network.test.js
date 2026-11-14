@@ -9,7 +9,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { validateProxyUrl } from '../server/network.mjs';
+import { isPublicAddress, validateProxyUrl } from '../server/network.mjs';
 
 const endpoint = 'https://api.openai.com/v1/chat/completions';
 const networkModule = new URL('../server/network.mjs', import.meta.url).href;
@@ -95,19 +95,37 @@ async function proxyFixture(t, { tlsOptions, responder, status = 200, extraHead 
         socket.pipe(target); target.pipe(socket);
     });
     const port = await listen(t, proxy);
-    return { proxyUrl: `http://127.0.0.1:${port}`, requests, connects, plaintext };
+    return { proxyUrl: `http://127.0.0.1:${port}`, targetPort, requests, connects, plaintext };
 }
 
 async function child(options, { ca, mode = 'network', directory } = {}) {
     const script = `
         import dns from 'node:dns';
         import dnsPromises from 'node:dns/promises';
+        import net from 'node:net';
         import { openUpstream, readLimited } from ${JSON.stringify(networkModule)};
         import { AgentService } from ${JSON.stringify(agentModule)};
         const config = ${JSON.stringify(options)};
         let dnsCalls = 0;
         dns.lookup = () => { dnsCalls++; throw new Error('TARGET_DNS_MUST_NOT_RUN'); };
-        dnsPromises.lookup = async () => { dnsCalls++; if(config.fakeDns) return [{address:'198.18.0.2',family:4}]; throw new Error('TARGET_DNS_MUST_NOT_RUN'); };
+        dnsPromises.lookup = async () => { dnsCalls++; if(config.dnsAnswers) return config.dnsAnswers; if(config.fakeDns) return [{address:'198.18.0.2',family:4}]; throw new Error('TARGET_DNS_MUST_NOT_RUN'); };
+        const routed = [];
+        if(config.routePort) {
+            // Test-only stand-in for OS/TUN routing. Consume the production pinned
+            // lookup, then redirect just the TCP socket to the local TLS fixture.
+            // The real HTTPS/TLS code still authenticates the original hostname.
+            const connect = net.Socket.prototype.connect;
+            net.Socket.prototype.connect = function(...args) {
+                const options = args[0];
+                if(options && typeof options === 'object' && typeof options.lookup === 'function') {
+                    const route = {host:options.host,port:Number(options.port)};
+                    options.lookup(options.host,{all:true},(error,addresses)=>{route.addresses=addresses;route.error=error?.code;});
+                    routed.push(route);
+                    args[0] = {...options,host:'127.0.0.1',port:config.routePort,lookup:undefined};
+                }
+                return connect.apply(this,args);
+            };
+        }
         let output;
         try {
             if (${JSON.stringify(mode)} === 'agent') {
@@ -124,16 +142,17 @@ async function child(options, { ca, mode = 'network', directory } = {}) {
                 if(config.abortAfter !== undefined) abortTimer=setTimeout(()=>controller.abort(),config.abortAfter);
                 if(config.abortBefore) controller.abort();
                 try {
-                    const response = await openUpstream(config.endpoint || ${JSON.stringify(endpoint)}, {method:config.method || 'POST',headers:{Authorization:${JSON.stringify(`Bearer ${testKey}`)},'Content-Type':'application/json',Host:'wrong.test','Proxy-Authorization':'do-not-forward'},body:config.method==='GET'?undefined:'{"test":"private payload"}',timeoutMs:config.timeoutMs || 1500,signal:controller.signal,proxyUrl:config.proxyUrl});
+                    const response = await openUpstream(config.endpoint || ${JSON.stringify(endpoint)}, {method:config.method || 'POST',headers:{Authorization:${JSON.stringify(`Bearer ${testKey}`)},'Content-Type':'application/json',Host:config.hostHeader || 'wrong.test','Proxy-Authorization':'do-not-forward'},body:config.method==='GET'?undefined:'{"test":"private payload"}',timeoutMs:config.timeoutMs || 1500,signal:controller.signal,proxyUrl:config.proxyUrl});
                     output={ok:true,status:response.statusCode,body:await readLimited(response)};
                 } finally { clearTimeout(abortTimer); }
             }
         } catch(error) { output={ok:false,code:error.code || error.message}; }
-        console.log(JSON.stringify({...output,dnsCalls}));
+        console.log(JSON.stringify({...output,dnsCalls,...(config.routePort ? {routed} : {})}));
     `;
     const env = { ...process.env };
     delete env.NODE_EXTRA_CA_CERTS;
     delete env.NODE_TLS_REJECT_UNAUTHORIZED;
+    if (options.insecureEnvironment) env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
     if (ca) env.NODE_EXTRA_CA_CERTS = ca;
     return new Promise((resolve, reject) => {
         const processChild = spawn(process.execPath, ['--input-type=module', '-e', script], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -230,8 +249,8 @@ test('real CONNECT/TLS avoids destination DNS and bounds failures', async t => {
         assert.deepEqual(await child({ proxyUrl: fixture.proxyUrl, abortBefore: true }), { ok: false, code: 'PROXY_ABORTED', dnsCalls: 0 });
         assert.equal(fixture.connects.length, 1);
     });
-    await t.test('direct route still rejects Fake-IP instead of bypassing private-address protection', async () => {
-        assert.deepEqual(await child({ fakeDns: true }), { ok: false, code: 'PRIVATE_ENDPOINT_FORBIDDEN', dnsCalls: 1 });
+    await t.test('other origins still reject Fake-IP instead of bypassing private-address protection', async () => {
+        assert.deepEqual(await child({ fakeDns: true, endpoint: 'https://other.example/v1/chat/completions' }), { ok: false, code: 'PRIVATE_ENDPOINT_FORBIDDEN', dnsCalls: 1 });
     });
     await t.test('Agent check and budgeted generation both use the selected proxy', async t => {
         const fixture = await proxyFixture(t, { tlsOptions: await certs.pair(), responder: (req, res) => {
@@ -255,6 +274,105 @@ test('real CONNECT/TLS avoids destination DNS and bounds failures', async t => {
         assert.equal(fixture.requests[0].body, '');
         assert.equal(fixture.connects.length, 2);
         assert.doesNotMatch(JSON.stringify(fixture.connects), new RegExp(testKey));
+        assert.doesNotMatch(JSON.stringify(result), new RegExp(testKey));
+    });
+});
+
+test('official OpenAI direct route supports only the common DNS Fake-IP pool with verified TLS', async t => {
+    const certs = await certificates(t);
+    for (const address of ['198.18.0.0', '198.18.0.2', '198.19.255.255']) assert.equal(isPublicAddress(address), false);
+    for (const address of ['198.18.0.2', '198.19.255.254', '8.8.8.8']) {
+        await t.test(`DNS answer ${address} stays pinned while using normal HTTPS identity`, async t => {
+            const fixture = await proxyFixture(t, { tlsOptions: await certs.pair() });
+            const dnsAnswers = [{ address, family: 4 }, { address: '8.8.4.4', family: 4 }];
+            const result = await child({ dnsAnswers, routePort: fixture.targetPort }, { ca: certs.ca });
+            assert.deepEqual(result, {
+                ok: true, status: 200, body: '{"ok":true}', dnsCalls: 1,
+                routed: [{ host: 'api.openai.com', port: 443, addresses: [dnsAnswers[0]] }],
+            });
+            assert.equal(fixture.requests.length, 1);
+            assert.equal(fixture.requests[0].headers.host, 'api.openai.com');
+            assert.equal(fixture.requests[0].servername, 'api.openai.com');
+            assert.equal(fixture.requests[0].headers.authorization, `Bearer ${testKey}`);
+            assert.equal(fixture.requests[0].body, '{"test":"private payload"}');
+            assert.equal(fixture.connects.length, 0);
+        });
+    }
+    for (const [title, certificate, trust] of [['untrusted certificate', 'valid', false], ['trusted wrong-host certificate', 'wrong', true]]) {
+        await t.test(`${title} blocks API data even with NODE_TLS_REJECT_UNAUTHORIZED=0`, async t => {
+            const fixture = await proxyFixture(t, { tlsOptions: await certs.pair(certificate) });
+            const result = await child({ fakeDns: true, routePort: fixture.targetPort, insecureEnvironment: true, hostHeader: 'wrong.example.test' }, { ca: trust ? certs.ca : undefined });
+            assert.equal(result.ok, false);
+            assert.equal(result.code, 'UPSTREAM_CONNECTION_FAILED');
+            assert.equal(result.dnsCalls, 1);
+            assert.deepEqual(result.routed, [{ host: 'api.openai.com', port: 443, addresses: [{ address: '198.18.0.2', family: 4 }] }]);
+            assert.equal(fixture.requests.length, 0);
+            assert.equal(fixture.connects.length, 0);
+        });
+    }
+    await t.test('private DNS answers and mixed allowed/private lists are rejected before connection', async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair() });
+        for (const address of ['127.0.0.1', '10.0.0.1', '172.16.0.1', '192.168.0.1', '169.254.169.254', '100.64.0.1', '::1', 'fc00::1', '::ffff:198.18.0.1']) {
+            const family = net.isIP(address);
+            for (const dnsAnswers of [[{ address, family }], [{ address: '198.18.0.2', family: 4 }, { address, family }]]) {
+                const result = await child({ dnsAnswers, routePort: fixture.targetPort });
+                assert.deepEqual(result, { ok: false, code: 'PRIVATE_ENDPOINT_FORBIDDEN', dnsCalls: 1, routed: [] });
+            }
+        }
+        assert.equal(fixture.requests.length, 0);
+    });
+    await t.test('Fake-IP exception does not include other domains, ports, HTTP or numeric URLs', async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair() });
+        for (const [target, code, dnsCalls] of [
+            ['https://other.example/v1', 'PRIVATE_ENDPOINT_FORBIDDEN', 1],
+            ['https://api.openai.com.evil.test/v1', 'PRIVATE_ENDPOINT_FORBIDDEN', 1],
+            ['https://api.openai.com.:443/v1', 'PRIVATE_ENDPOINT_FORBIDDEN', 1],
+            ['https://api.openai.com:444/v1', 'PRIVATE_ENDPOINT_FORBIDDEN', 1],
+            ['http://api.openai.com/v1', 'HTTPS_REQUIRED', 0],
+            ['https://198.18.0.2/v1', 'PRIVATE_ENDPOINT_FORBIDDEN', 0],
+            ['https://198.19.255.254/v1', 'PRIVATE_ENDPOINT_FORBIDDEN', 0],
+            ['https://localhost/v1', 'LOCAL_ENDPOINT_NOT_ENABLED', 0],
+        ]) {
+            assert.deepEqual(await child({ endpoint: target, fakeDns: true, routePort: fixture.targetPort }), { ok: false, code, dnsCalls, routed: [] });
+        }
+        assert.equal(fixture.requests.length, 0);
+    });
+    await t.test('direct Fake-IP response redirect is refused without another DNS query or socket', async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair(), responder: (_req, res) => { res.writeHead(302, { location: 'https://api.openai.com/other' }); res.end(); } });
+        const result = await child({ fakeDns: true, routePort: fixture.targetPort }, { ca: certs.ca });
+        assert.equal(result.code, 'UPSTREAM_REDIRECT_FORBIDDEN');
+        assert.equal(result.dnsCalls, 1);
+        assert.equal(result.routed.length, 1);
+        assert.equal(fixture.requests.length, 1);
+        assert.equal(fixture.connects.length, 0);
+    });
+    await t.test('Agent check and budgeted generation use normal Fake-IP routing without a proxy setting', async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair(), responder: (req, res) => {
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify(req.method === 'GET' ? { id: 'test-model', object: 'model' } : {
+                usage: { prompt_tokens: 20, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens: 10 },
+                choices: [{ message: { content: '{"expectedVersion":1,"reason":"fixture","operations":[]}' } }],
+            }));
+        } });
+        const directory = path.join(certs.directory, 'direct-agent-state');
+        await fs.mkdir(directory);
+        const result = await child({ fakeDns: true, routePort: fixture.targetPort }, { ca: certs.ca, mode: 'agent', directory });
+        assert.equal(result.ok, true, JSON.stringify(result));
+        assert.equal(result.dnsCalls, 2);
+        assert.equal(result.routed.length, 2);
+        for (const route of result.routed) assert.deepEqual(route, { host: 'api.openai.com', port: 443, addresses: [{ address: '198.18.0.2', family: 4 }] });
+        assert.equal(result.check.ok, true);
+        assert.equal(result.check.budgetConsumed, false);
+        assert.equal(result.beforeCalls, 0);
+        assert.equal(result.status.ledger.calls, 1);
+        assert.equal(result.result.record.purpose, 'agent');
+        assert.deepEqual(fixture.requests.map(req => [req.method, req.url]), [['GET', '/v1/models/test-model'], ['POST', '/v1/chat/completions']]);
+        assert.equal(fixture.requests[0].body, '');
+        for (const req of fixture.requests) {
+            assert.equal(req.headers.host, 'api.openai.com');
+            assert.equal(req.servername, 'api.openai.com');
+        }
+        assert.equal(fixture.connects.length, 0);
         assert.doesNotMatch(JSON.stringify(result), new RegExp(testKey));
     });
 });

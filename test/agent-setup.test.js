@@ -184,6 +184,8 @@ test('Clash proxy hydration restores saved route but preserves an edited proxy d
     assert.equal(field('agentEndpoint').value, OPENAI_STARTER.endpoint);
     assert.equal(field('agentProxyURL').value, config.proxyUrl);
     assert.equal(field('agentProxyEnabled').checked, true);
+    assert.equal(field('agentProxyDetails').open, true, 'Saved manual proxy remains visible');
+    assert.match(field('agentStatus').textContent, /已保存连接方式：手动本机代理/);
     assert.equal(field('agentKey').value, '');
   }, { configured: true, config });
   await proxyPanel(async ({ field, click, edit, calls }) => {
@@ -193,6 +195,7 @@ test('Clash proxy hydration restores saved route but preserves an edited proxy d
     assert.equal(field('agentProxyEnabled').checked, false);
     await click('check-agent');
     assert.equal(calls.at(-1).body.proxyUrl, '');
+    assert.match(field('agentConnection').textContent, /连接方式：沿用设备网络/);
   }, { configured: true, config });
 });
 
@@ -229,7 +232,8 @@ test('OpenAI quick preset before server check retains saved proxy without inheri
 });
 
 test('Clash errors explain DNS guard, local proxy, and TLS without suggesting Fake-IP shutdown', () => {
-  assert.match(agentSetupError('PRIVATE_ENDPOINT_FORBIDDEN'), /可能触发/);
+  assert.match(agentSetupError('PRIVATE_ENDPOINT_FORBIDDEN'), /不是你的公网出口 IP/);
+  assert.match(agentSetupError('PRIVATE_ENDPOINT_FORBIDDEN'), /不能仅凭此错误确定原因/);
   assert.match(agentSetupError('PRIVATE_ENDPOINT_FORBIDDEN'), /无需关闭 Fake-IP/);
   for (const code of ['PROXY_URL_INVALID', 'PROXY_LOOPBACK_REQUIRED', 'PROXY_OPENAI_ONLY', 'PROXY_CONNECTION_FAILED', 'PROXY_AUTH_REQUIRED', 'PROXY_CONNECT_REJECTED', 'PROXY_TLS_FAILED', 'PROXY_TIMEOUT', 'PROXY_ABORTED']) {
     const message = agentSetupError(code);

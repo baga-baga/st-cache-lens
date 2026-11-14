@@ -3,9 +3,47 @@ import https from 'node:https';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 import tls from 'node:tls';
+import { NETWORK_REASONS, sanitizeNetworkDiagnostic } from '../core/network-diagnostics.js';
 
 export class ServiceError extends Error {
     constructor(code, status = 400) { super(code); this.code = code; this.status = status; }
+}
+
+const networkReasons = new Set(NETWORK_REASONS);
+const transportCodes = new Set(['UPSTREAM_CONNECTION_FAILED', 'UPSTREAM_DNS_FAILED', 'UPSTREAM_TIMEOUT', 'UPSTREAM_ABORTED', 'PROXY_CONNECTION_FAILED', 'PROXY_TLS_FAILED', 'PROXY_TIMEOUT', 'PROXY_ABORTED']);
+const responseNetwork = Symbol('cache-lens-network-state');
+
+function networkError(error, state, code = 'UPSTREAM_CONNECTION_FAILED', status = 502) {
+    const failure = error instanceof ServiceError ? error : new ServiceError(code, status);
+    if (!transportCodes.has(failure.code)) return failure;
+    let reason = sanitizeNetworkDiagnostic(error?.network)?.reason ?? (networkReasons.has(error?.code) ? error.code : 'UNKNOWN');
+    if (typeof error?.code === 'string' && error.code.endsWith('_TIMEOUT')) reason = 'TIMEOUT';
+    if (typeof error?.code === 'string' && error.code.endsWith('_ABORTED')) reason = 'ABORTED';
+    if (reason === 'UNKNOWN' && Array.isArray(error?.errors)) {
+        const reasons = [...new Set(error.errors.slice(0, 16).map(item => item?.code).filter(item => networkReasons.has(item)))];
+        reason = reasons.length === 1 ? reasons[0] : reasons.length ? 'ALL_ADDRESSES_FAILED' : 'UNKNOWN';
+    }
+    // Never retain the raw error, address, URL, headers, certificate or message.
+    failure.network = {
+        version: 1, reason, phase: state.phase, route: state.route,
+        requestMayHaveBeenSent: state.requestMayHaveBeenSent === true,
+        responseHeadersReceived: state.responseHeadersReceived === true,
+        elapsedMs: Math.min(86400000, Math.max(0, Math.round(performance.now() - state.started))),
+    };
+    return failure;
+}
+
+function requestProgress(request, state, encrypted) {
+    request.once('socket', socket => {
+        if (encrypted) socket.once('connect', () => { state.phase = 'tls'; });
+        socket.once(encrypted ? 'secureConnect' : 'connect', () => {
+            state.requestMayHaveBeenSent = true;
+            state.phase = request.writableFinished ? 'wait-headers' : 'send';
+        });
+    });
+    request.once('finish', () => {
+        if (state.requestMayHaveBeenSent && !state.responseHeadersReceived) state.phase = 'wait-headers';
+    });
 }
 
 export function isLoopback(host) {
@@ -83,6 +121,7 @@ function openViaProxy(url, { proxyUrl, method, headers, body, timeoutMs, signal 
         let connectRequest, tunnelSocket, secureSocket, apiRequest, response, agent;
         let stopped = false;
         let tunnelEstablished = false;
+        const state = { started: performance.now(), phase: 'proxy-connect', route: 'local-proxy', requestMayHaveBeenSent: false, responseHeadersReceived: false };
         const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 120000;
         const timer = setTimeout(() => fail(new ServiceError('PROXY_TIMEOUT', 504)), deadline);
         const abort = () => fail(new ServiceError('PROXY_ABORTED', 499));
@@ -100,11 +139,12 @@ function openViaProxy(url, { proxyUrl, method, headers, body, timeoutMs, signal 
         function fail(error) {
             if (stopped) return;
             stopped = true;
+            const failure = networkError(error, state);
             clearControls();
             // Once headers are returned, propagate the error to the body reader too.
-            response?.destroy(error);
+            response?.destroy(failure);
             destroyTransport();
-            reject(error);
+            reject(failure);
         }
         function finish() {
             if (stopped) return;
@@ -120,7 +160,7 @@ function openViaProxy(url, { proxyUrl, method, headers, body, timeoutMs, signal 
                 port: Number(proxy.port || 80), method: 'CONNECT', path: 'api.openai.com:443',
                 headers: { Host: 'api.openai.com:443' }, agent: false, maxHeaderSize: 16384,
             });
-            connectRequest.once('error', () => fail(new ServiceError('PROXY_CONNECTION_FAILED', 502)));
+            connectRequest.on('error', error => fail(networkError(error, state, 'PROXY_CONNECTION_FAILED')));
             connectRequest.once('response', incoming => {
                 incoming.resume();
                 fail(new ServiceError(incoming.statusCode === 407 ? 'PROXY_AUTH_REQUIRED' : 'PROXY_CONNECT_REJECTED', 502));
@@ -135,17 +175,20 @@ function openViaProxy(url, { proxyUrl, method, headers, body, timeoutMs, signal 
                 // TLS cannot have server data before this client sends ClientHello.
                 if (head.length) { fail(new ServiceError('PROXY_CONNECT_REJECTED', 502)); return; }
                 try {
+                    state.phase = 'tls';
                     secureSocket = tls.connect({
                         socket, servername: 'api.openai.com', rejectUnauthorized: true,
                         ALPNProtocols: ['http/1.1'],
                     });
-                    secureSocket.once('error', () => fail(new ServiceError(tunnelEstablished ? 'UPSTREAM_CONNECTION_FAILED' : 'PROXY_TLS_FAILED', 502)));
+                    secureSocket.on('error', error => fail(networkError(error, state, tunnelEstablished ? 'UPSTREAM_CONNECTION_FAILED' : 'PROXY_TLS_FAILED')));
                     secureSocket.once('secureConnect', () => {
                         if (stopped) return;
                         if (!secureSocket.authorized || tls.checkServerIdentity('api.openai.com', secureSocket.getPeerCertificate())) {
                             fail(new ServiceError('PROXY_TLS_FAILED', 502)); return;
                         }
                         tunnelEstablished = true;
+                        state.phase = 'send';
+                        state.requestMayHaveBeenSent = true;
                         try {
                             // The one-shot agent can only return this verified socket; it
                             // cannot open another socket, resolve the target or fall back.
@@ -168,18 +211,26 @@ function openViaProxy(url, { proxyUrl, method, headers, body, timeoutMs, signal 
                                     fail(new ServiceError('UPSTREAM_REDIRECT_FORBIDDEN', 502)); return;
                                 }
                                 response = incomingResponse;
+                                state.phase = 'body';
+                                state.responseHeadersReceived = true;
+                                response[responseNetwork] = state;
                                 response.once('end', finish);
-                                response.once('close', finish);
+                                response.on('error', fail);
+                                response.once('close', () => {
+                                    if (!response.complete) fail(Object.assign(new Error(), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
+                                    else finish();
+                                });
                                 resolve(response);
                             });
-                            apiRequest.once('error', () => fail(new ServiceError('UPSTREAM_CONNECTION_FAILED', 502)));
+                            apiRequest.once('finish', () => { if (!state.responseHeadersReceived) state.phase = 'wait-headers'; });
+                            apiRequest.on('error', error => fail(networkError(error, state)));
                             apiRequest.end(body);
-                        } catch { fail(new ServiceError('UPSTREAM_CONNECTION_FAILED', 502)); }
+                        } catch (error) { fail(networkError(error, state)); }
                     });
-                } catch { fail(new ServiceError('PROXY_TLS_FAILED', 502)); }
+                } catch (error) { fail(networkError(error, state, 'PROXY_TLS_FAILED')); }
             });
             connectRequest.end();
-        } catch { fail(new ServiceError('PROXY_CONNECTION_FAILED', 502)); }
+        } catch (error) { fail(networkError(error, state, 'PROXY_CONNECTION_FAILED')); }
     });
 }
 
@@ -189,15 +240,6 @@ export async function openUpstream(value, { method = 'POST', headers = {}, body,
     const validatedProxy = validateProxyUrl(proxyUrl, { endpoint: url });
     if (validatedProxy) return openViaProxy(url, { proxyUrl: validatedProxy, method, headers, body, timeoutMs, signal });
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
-    let addresses;
-    try { addresses = net.isIP(hostname) ? [{ address: hostname, family: net.isIP(hostname) }] : await dns.lookup(hostname, { all: true }); }
-    catch { throw new ServiceError('UPSTREAM_DNS_FAILED', 502); }
-    if (!addresses.length || addresses.some(({address}) => !isPublicAddress(address)
-        && !isOfficialOpenAIFakeIp(url, address)
-        && !(allowLocal && isLoopback(hostname) && isLoopback(address)))) {
-        throw new ServiceError('PRIVATE_ENDPOINT_FORBIDDEN');
-    }
-    const selected = addresses[0];
     const officialOpenAI = url.origin === 'https://api.openai.com';
     const requestHeaders = officialOpenAI ? { ...headers } : headers;
     if (officialOpenAI) {
@@ -209,27 +251,88 @@ export async function openUpstream(value, { method = 'POST', headers = {}, body,
         requestHeaders.Host = 'api.openai.com';
     }
     return await new Promise((resolve, reject) => {
-        const request = (url.protocol === 'https:' ? https : http).request(url, {
-            method, headers: requestHeaders, signal, agent: false, rejectUnauthorized: true,
-            ...(officialOpenAI ? { servername: 'api.openai.com' } : {}),
-            lookup: (_name, options, callback) => options?.all ? callback(null, [selected]) : callback(null, selected.address, selected.family),
-        }, response => {
-            if (response.statusCode >= 300 && response.statusCode < 400) {
-                response.resume(); reject(new ServiceError('UPSTREAM_REDIRECT_FORBIDDEN', 502));
-            } else resolve(response);
-        });
-        request.setTimeout(timeoutMs, () => request.destroy(new ServiceError('UPSTREAM_TIMEOUT', 504)));
-        request.on('error', error => reject(error instanceof ServiceError ? error : new ServiceError('UPSTREAM_CONNECTION_FAILED', 502)));
-        request.end(body);
+        let request, response, stopped = false;
+        const state = { started: performance.now(), phase: 'dns', route: 'direct', requestMayHaveBeenSent: false, responseHeadersReceived: false };
+        const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 120000;
+        const timer = setTimeout(() => fail(new ServiceError('UPSTREAM_TIMEOUT', 504)), deadline);
+        const abort = () => fail(new ServiceError('UPSTREAM_ABORTED', 499));
+        const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
+        function fail(error) {
+            if (stopped) return;
+            stopped = true;
+            const failure = networkError(error, state);
+            cleanup();
+            response?.destroy(failure);
+            request?.destroy(failure);
+            reject(failure);
+        }
+        function finish() {
+            if (stopped) return;
+            stopped = true;
+            cleanup();
+        }
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) { abort(); return; }
+        const start = async () => {
+            let addresses;
+            try { addresses = net.isIP(hostname) ? [{ address: hostname, family: net.isIP(hostname) }] : await dns.lookup(hostname, { all: true }); }
+            catch (error) { throw networkError(error, state, 'UPSTREAM_DNS_FAILED'); }
+            // A late DNS result must not open a socket after timeout or cancellation.
+            if (stopped) return;
+            if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address)
+                && !isOfficialOpenAIFakeIp(url, address)
+                && !(allowLocal && isLoopback(hostname) && isLoopback(address)))) {
+                throw new ServiceError('PRIVATE_ENDPOINT_FORBIDDEN');
+            }
+            // Validate the complete list once, then pin every address. Node's TCP
+            // family selection can try reachable addresses before HTTP is sent;
+            // this does not retry a POST, weaken TLS, or resolve the name again.
+            const pinned = addresses.map(({ address, family }) => ({ address, family }));
+            state.phase = 'connect';
+            request = (url.protocol === 'https:' ? https : http).request(url, {
+                method, headers: requestHeaders, agent: false, rejectUnauthorized: true,
+                autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250,
+                ...(officialOpenAI ? { servername: 'api.openai.com' } : {}),
+                lookup: (_name, options, callback) => options?.all
+                    ? callback(null, pinned.map(item => ({ ...item })))
+                    : callback(null, pinned[0].address, pinned[0].family),
+            }, incoming => {
+                if (stopped) { incoming.destroy(); return; }
+                response = incoming;
+                state.responseHeadersReceived = true;
+                state.phase = 'body';
+                response[responseNetwork] = state;
+                response.on('error', fail);
+                response.once('end', finish);
+                response.once('close', () => {
+                    if (!response.complete) fail(Object.assign(new Error(), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
+                    else finish();
+                });
+                if (response.statusCode >= 300 && response.statusCode < 400) {
+                    fail(new ServiceError('UPSTREAM_REDIRECT_FORBIDDEN', 502));
+                } else resolve(response);
+            });
+            requestProgress(request, state, url.protocol === 'https:');
+            request.on('error', fail);
+            request.end(body);
+        };
+        start().catch(fail);
     });
 }
 
 export async function readLimited(stream, maxBytes = 1024 * 1024) {
     const chunks = []; let bytes = 0;
-    for await (const chunk of stream) {
-        bytes += chunk.length;
-        if (bytes > maxBytes) { stream.destroy(); throw new ServiceError('RESPONSE_TOO_LARGE', 502); }
-        chunks.push(chunk);
+    try {
+        for await (const chunk of stream) {
+            bytes += chunk.length;
+            if (bytes > maxBytes) { stream.destroy(); throw new ServiceError('RESPONSE_TOO_LARGE', 502); }
+            chunks.push(chunk);
+        }
+    } catch (error) {
+        if (error instanceof ServiceError) throw error;
+        const state = stream[responseNetwork];
+        if (state) { state.phase = 'body'; throw networkError(error, state); }
+        throw error;
     }
     return Buffer.concat(chunks).toString('utf8');
 }

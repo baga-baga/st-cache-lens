@@ -1,6 +1,7 @@
 /** Bounded paginated audit. No file, native configuration or prompt writes. */
 import { summarizeBatchPlan } from './batch-plan-report.js';
 import { auditCollectionEvidence } from './audit-evidence.js';
+import { sanitizeNetworkDiagnostic } from '../core/network-diagnostics.js';
 export const AUDIT_VERSION = 1;
 export const AUDIT_PAGE_BYTES = 18000;
 const MAX_ROWS = 80;
@@ -14,7 +15,7 @@ const AUDIT_FAILURE_CODES = new Set([
  'SYMLINK_STATE_DIRECTORY_FORBIDDEN','SYMLINK_STATE_FILE_FORBIDDEN',
  'INVALID_ENDPOINT','ENDPOINT_CREDENTIALS_OR_QUERY_FORBIDDEN','HTTPS_REQUIRED',
  'LOCAL_ENDPOINT_NOT_ENABLED','PRIVATE_ENDPOINT_FORBIDDEN','RESPONSE_TOO_LARGE',
- 'UPSTREAM_CONNECTION_FAILED','UPSTREAM_DNS_FAILED','UPSTREAM_TIMEOUT','UPSTREAM_REDIRECT_FORBIDDEN',
+ 'UPSTREAM_CONNECTION_FAILED','UPSTREAM_DNS_FAILED','UPSTREAM_TIMEOUT','UPSTREAM_ABORTED','UPSTREAM_REDIRECT_FORBIDDEN',
  'PROXY_URL_INVALID','PROXY_LOOPBACK_REQUIRED','PROXY_OPENAI_ONLY','PROXY_CONNECTION_FAILED',
  'PROXY_AUTH_REQUIRED','PROXY_CONNECT_REJECTED','PROXY_TLS_FAILED','PROXY_TIMEOUT','PROXY_ABORTED',
  'LOCAL_OPERATION_TIMEOUT','LOCAL_OPERATION_ABORTED','CLIENT_NETWORK_ERROR','SERVER_RESPONSE_INVALID_JSON',
@@ -34,6 +35,8 @@ export function safeAuditFailure(error, { stage, pageIndex } = {}) {
  if (Number.isSafeInteger(pageIndex) && pageIndex >= 0 && pageIndex < 24) result.page = pageIndex + 1;
  if (Number.isSafeInteger(error?.httpStatus) && error.httpStatus >= 100 && error.httpStatus <= 599) result.httpStatus = error.httpStatus;
  if (/^AGENT_HTTP_[45]\d{2}$/.test(code)) result.upstreamHttpStatus = Number(code.slice('AGENT_HTTP_'.length));
+ const network = sanitizeNetworkDiagnostic(error?.network);
+ if (network) result.network = network;
  return result;
 }
 const rows = v => Array.isArray(v) ? v : [];

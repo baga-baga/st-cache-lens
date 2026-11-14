@@ -14,6 +14,7 @@ import { auditCollectionEvidence, collectionBlockingCodes, collectionIssueMessag
 import { sanitizeAgentHistory, auditFailureMessage, agentHistorySummary } from './adapters/audit-recovery.js';
 import { auditBudget } from './adapters/agent-audit-budget.js';
 import { boundedWait } from './adapters/bounded-wait.js';
+import { sanitizeNetworkDiagnostic, networkDiagnosticText, isTransportFailureCode } from './core/network-diagnostics.js';
 import { runBatchPolicy, EMPTY_BATCH_POLICY, BATCH_ALGORITHM } from './adapters/batch-runner.js';
 import { observationLayer, ledgerRecords, pricesFor, agentObservation, trialInput, compactDiagnostic, agentPayload, acceptedAgentProposal, agentConfigWithBudget, validatePriceTable, optionalCachePrices, redactedExport, importEvidence } from './adapters/reporting.js';
 import { hasObservedContext, normalizeUISources, worldSummary } from './adapters/ui-data.js';
@@ -56,7 +57,7 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
   let externalSnapshot = stableStringify(context.extensionSettings?.[KEY] ?? null);
   const root = document.createElement('section');root.id = 'cache-lens-panel'; root.className = 'cl-panel';
   root.innerHTML = `
-  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.10</span> 缓存与费用观察</summary>
+  <details open><summary><strong>Cache Lens</strong> <span class="cl-badge">0.1.11</span> 缓存与费用观察</summary>
   <p class="cl-note">只根据已观察证据诊断。前端相同不等于上游命中；正文、摘要和 Agent 单独计费。</p>
   <div class="cl-status" data-id="status" role="status">正在初始化</div>
   <details open class="cl-quick"><summary>一键批量诊断 · 从这里开始</summary>
@@ -428,7 +429,12 @@ export function mountCacheLens({ context = globalThis.SillyTavern?.getContext?.(
       let r;
       try{r=await fetch('/api/plugins/cache-lens/'+path,{method:body===undefined?'GET':'POST',headers,body:body===undefined?undefined:json(body),signal:requestSignal});}
       catch{throw Object.assign(new Error('浏览器连接酒馆服务端失败；此前请求可能仍在处理，未自动重试。'),{code:'CLIENT_NETWORK_ERROR'});}
-      if(!r.ok){let code='';try{const data=await r.json();if(/^[A-Z0-9_]{1,100}$/.test(data.error))code=data.error;}catch{}const error=new Error(agentSetupError(code,r.status));error.code=code;error.httpStatus=r.status;throw error;}
+      if(!r.ok){
+        let code='',network=null;
+        try{const data=await r.json();if(/^[A-Z0-9_]{1,100}$/.test(data.error))code=data.error;network=sanitizeNetworkDiagnostic(data.network);}catch{}
+        const error=new Error(network&&isTransportFailureCode(code)?`${code}\n${networkDiagnosticText(network)}`:agentSetupError(code,r.status));
+        error.code=code;error.httpStatus=r.status;if(network)error.network=network;throw error;
+      }
       try{return await r.json();}
       catch{throw Object.assign(new Error('酒馆服务端未返回可解析的 JSON；未自动重试。'),{code:'SERVER_RESPONSE_INVALID_JSON',httpStatus:r.status});}
     },{timeoutMs:paid?deadlines.agent:deadlines.read,signal,message:paid?'等待 Agent 返回超时；已停止后续调用，不会自动重试。服务端这次调用仍可能完成并计费，请先刷新费用记录。':'酒馆服务端响应超时；未自动重试，请检查酒馆是否仍在运行。'});

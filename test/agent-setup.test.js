@@ -15,12 +15,13 @@ test('Agent onboarding: preset, zero-budget model check, explicit saving, and he
   const calls = [];
   let missing = false;
   let checkFailure = null;
+  let checkNetworkFailure = null;
   const context = { extensionSettings: {}, saveSettingsDebounced() {}, getWorldInfoNames: () => [] };
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null });
     if (missing) return new Response('<html>not installed</html>', { status: 404 });
     if (url.endsWith('/status')) return Response.json({ configured: false, serverVersion: '0.1.1', capabilities: { agentCheck: true } });
-    if (url.endsWith('/agent-check')) return Response.json(checkFailure || { ok: true, authenticationVerified: true, modelVisible: true, model: OPENAI_STARTER.model, generationVerified: false });
+    if (url.endsWith('/agent-check')) return checkNetworkFailure ? Response.json(checkNetworkFailure, { status: 502 }) : Response.json(checkFailure || { ok: true, authenticationVerified: true, modelVisible: true, model: OPENAI_STARTER.model, generationVerified: false });
     if (url.endsWith('/agent-config')) return Response.json({ configured: true, config: { model: OPENAI_STARTER.model, hasKey: true } });
     throw new Error('Unexpected API call ' + url);
   };
@@ -54,6 +55,12 @@ test('Agent onboarding: preset, zero-budget model check, explicit saving, and he
       assert.equal(field('agentConnection').textContent.includes('连接检查通过'), false);
     }
     checkFailure = null;
+    checkNetworkFailure = { error: 'UPSTREAM_CONNECTION_FAILED', network: { version: 1, reason: 'ECONNRESET', phase: 'tls', route: 'direct', requestMayHaveBeenSent: false, responseHeadersReceived: false, elapsedMs: 84, message: 'synthetic-private-message', address: '192.0.2.1' } };
+    await click('check-agent');
+    assert.match(field('agentConnection').textContent, /ECONNRESET/);
+    assert.match(field('agentConnection').textContent, /建立加密连接/);
+    assert.doesNotMatch(field('agentConnection').textContent, /synthetic-private-message|192\.0\.2\.1/);
+    checkNetworkFailure = null;
     await click('save-agent');
     assert.equal(calls.filter(c => c.url.endsWith('/agent-config')).length, 0);
     assert.match(field('agentStatus').textContent, /正数/);

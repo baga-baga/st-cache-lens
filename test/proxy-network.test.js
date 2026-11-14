@@ -39,6 +39,116 @@ test('proxy configuration requires explicit HTTP loopback port and official Open
     }
 });
 
+test('transport diagnostics distinguish failed phases and pinned TCP fallback never repeats HTTP', async t => {
+    const certs = await certificates(t);
+    const assertSafe = diagnostic => {
+        assert.equal(diagnostic.version, 1);
+        assert.ok(Number.isSafeInteger(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);
+        assert.deepEqual(Object.keys(diagnostic).sort(), ['elapsedMs', 'phase', 'reason', 'requestMayHaveBeenSent', 'responseHeadersReceived', 'route', 'version'].sort());
+        assert.doesNotMatch(JSON.stringify(diagnostic), /api\.openai|127\.0|198\.18|Bearer|private payload|credential|certificate|sk-fixture/i);
+    };
+    for (const [name, dnsAnswers, routeCandidates] of [
+        ['IPv6 then IPv4', [{ address: '2001:4860:4860::8888', family: 6 }, { address: '8.8.8.8', family: 4 }], [{ address: '::1', family: 6 }, { address: '127.0.0.1', family: 4 }]],
+        ['two IPv4 addresses', [{ address: '198.18.0.2', family: 4 }, { address: '8.8.8.8', family: 4 }], [{ address: '127.0.0.2', family: 4 }, { address: '127.0.0.1', family: 4 }]],
+    ]) await t.test(`${name}: unreachable first TCP address falls through to second with one authenticated POST`, async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair() });
+        const result = await child({ dnsAnswers, routePort: fixture.targetPort, routeCandidates, includeNetwork: true }, { ca: certs.ca });
+        assert.equal(result.ok, true, JSON.stringify(result));
+        assert.equal(result.dnsCalls, 1);
+        assert.deepEqual(result.routed, [{ host: 'api.openai.com', port: 443, addresses: dnsAnswers }]);
+        assert.equal(fixture.requests.length, 1);
+        assert.equal(fixture.requests[0].method, 'POST');
+        assert.equal(fixture.requests[0].servername, 'api.openai.com');
+        assert.equal(fixture.requests[0].headers.authorization, `Bearer ${testKey}`);
+    });
+    for (const proxy of [false, true]) await t.test(`${proxy ? 'CONNECT' : 'normal route'} GET succeeds but generation POST disconnects without automatic retry`, async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair(), responder: (req, res) => {
+            if (req.method === 'GET') res.end('{"id":"test-model"}');
+            else req.socket.destroy();
+        } });
+        const options = proxy ? { proxyUrl: fixture.proxyUrl } : { fakeDns: true, routePort: fixture.targetPort };
+        const check = await child({ ...options, method: 'GET' }, { ca: certs.ca });
+        assert.equal(check.ok, true);
+        const failed = await child({ ...options, includeNetwork: true }, { ca: certs.ca });
+        assert.equal(failed.code, 'UPSTREAM_CONNECTION_FAILED');
+        assertSafe(failed.network);
+        assert.equal(failed.network.reason, 'ECONNRESET');
+        assert.ok(['send', 'wait-headers'].includes(failed.network.phase), JSON.stringify(failed));
+        assert.equal(failed.network.route, proxy ? 'local-proxy' : 'direct');
+        assert.equal(failed.network.requestMayHaveBeenSent, true);
+        assert.equal(failed.network.responseHeadersReceived, false);
+        assert.deepEqual(fixture.requests.map(req => req.method), ['GET', 'POST']);
+    });
+    for (const proxy of [false, true]) await t.test(`${proxy ? 'CONNECT' : 'normal route'} incomplete body retains a safe transport failure`, async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair(), responder: (_req, res) => {
+            res.writeHead(200, { 'content-length': '500' }); res.write('{"partial":');
+            setTimeout(() => res.destroy(), 20);
+        } });
+        const options = proxy ? { proxyUrl: fixture.proxyUrl } : { fakeDns: true, routePort: fixture.targetPort };
+        const failed = await child({ ...options, includeNetwork: true }, { ca: certs.ca });
+        assert.equal(failed.code, 'UPSTREAM_CONNECTION_FAILED');
+        assertSafe(failed.network);
+        assert.ok(['ECONNRESET', 'ERR_STREAM_PREMATURE_CLOSE'].includes(failed.network.reason));
+        assert.equal(failed.network.phase, 'body');
+        assert.equal(failed.network.responseHeadersReceived, true);
+        assert.equal(fixture.requests.length, 1);
+    });
+    for (const proxy of [false, true]) await t.test(`${proxy ? 'CONNECT' : 'normal route'} absolute deadline covers a stalled response body`, async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair(), responder: (_req, res) => {
+            res.writeHead(200, { 'content-length': '500' }); res.write('{"partial":');
+        } });
+        const options = proxy ? { proxyUrl: fixture.proxyUrl } : { fakeDns: true, routePort: fixture.targetPort };
+        const failed = await child({ ...options, timeoutMs: 180, includeNetwork: true }, { ca: certs.ca });
+        assert.equal(failed.code, proxy ? 'PROXY_TIMEOUT' : 'UPSTREAM_TIMEOUT');
+        assertSafe(failed.network);
+        assert.equal(failed.network.reason, 'TIMEOUT');
+        assert.equal(failed.network.phase, 'body');
+        assert.equal(failed.network.responseHeadersReceived, true);
+        assert.equal(fixture.requests.length, 1);
+    });
+    await t.test('DNS timeout cannot connect after a late resolver result', async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair() });
+        const failed = await child({ fakeDns: true, dnsDelay: 160, routePort: fixture.targetPort, timeoutMs: 30, waitAfter: 250, includeNetwork: true }, { ca: certs.ca });
+        assert.equal(failed.code, 'UPSTREAM_TIMEOUT');
+        assertSafe(failed.network);
+        assert.equal(failed.network.phase, 'dns');
+        assert.equal(failed.network.requestMayHaveBeenSent, false);
+        assert.deepEqual(failed.routed, []);
+        assert.equal(fixture.requests.length, 0);
+    });
+    await t.test('aborting DNS prevents a late resolver result from opening a socket', async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair() });
+        const failed = await child({ fakeDns: true, dnsDelay: 160, routePort: fixture.targetPort, abortAfter: 25, waitAfter: 250, includeNetwork: true }, { ca: certs.ca });
+        assert.equal(failed.code, 'UPSTREAM_ABORTED');
+        assertSafe(failed.network);
+        assert.equal(failed.network.reason, 'ABORTED');
+        assert.equal(failed.network.phase, 'dns');
+        assert.equal(failed.network.requestMayHaveBeenSent, false);
+        assert.deepEqual(failed.routed, []);
+        assert.equal(fixture.requests.length, 0);
+    });
+    await t.test('DNS failures preserve only allowlisted codes', async () => {
+        for (const reason of ['ENOTFOUND', 'EAI_AGAIN', 'arbitrary-private-error-message']) {
+            const failed = await child({ dnsFailure: reason, includeNetwork: true });
+            assert.equal(failed.code, 'UPSTREAM_DNS_FAILED');
+            assertSafe(failed.network);
+            assert.equal(failed.network.reason, reason.startsWith('E') ? reason : 'UNKNOWN');
+            assert.equal(failed.network.phase, 'dns');
+            assert.equal(failed.network.requestMayHaveBeenSent, false);
+        }
+    });
+    await t.test('TLS hostname validation is reported without sending authorization or suppressing verification', async t => {
+        const fixture = await proxyFixture(t, { tlsOptions: await certs.pair('wrong') });
+        const failed = await child({ fakeDns: true, routePort: fixture.targetPort, insecureEnvironment: true, includeNetwork: true }, { ca: certs.ca });
+        assert.equal(failed.code, 'UPSTREAM_CONNECTION_FAILED');
+        assertSafe(failed.network);
+        assert.equal(failed.network.reason, 'ERR_TLS_CERT_ALTNAME_INVALID');
+        assert.equal(failed.network.phase, 'tls');
+        assert.equal(failed.network.requestMayHaveBeenSent, false);
+        assert.equal(fixture.requests.length, 0);
+    });
+});
+
 async function certificates(t) {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cache-lens-connect-'));
     t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -108,7 +218,7 @@ async function child(options, { ca, mode = 'network', directory } = {}) {
         const config = ${JSON.stringify(options)};
         let dnsCalls = 0;
         dns.lookup = () => { dnsCalls++; throw new Error('TARGET_DNS_MUST_NOT_RUN'); };
-        dnsPromises.lookup = async () => { dnsCalls++; if(config.dnsAnswers) return config.dnsAnswers; if(config.fakeDns) return [{address:'198.18.0.2',family:4}]; throw new Error('TARGET_DNS_MUST_NOT_RUN'); };
+        dnsPromises.lookup = async () => { dnsCalls++; if(config.dnsDelay) await new Promise(resolve=>setTimeout(resolve,config.dnsDelay)); if(config.dnsFailure) throw Object.assign(new Error('private address / credential must not escape'),{code:config.dnsFailure}); if(config.dnsAnswers) return config.dnsAnswers; if(config.fakeDns) return [{address:'198.18.0.2',family:4}]; throw new Error('TARGET_DNS_MUST_NOT_RUN'); };
         const routed = [];
         if(config.routePort) {
             // Test-only stand-in for OS/TUN routing. Consume the production pinned
@@ -121,7 +231,7 @@ async function child(options, { ca, mode = 'network', directory } = {}) {
                     const route = {host:options.host,port:Number(options.port)};
                     options.lookup(options.host,{all:true},(error,addresses)=>{route.addresses=addresses;route.error=error?.code;});
                     routed.push(route);
-                    args[0] = {...options,host:'127.0.0.1',port:config.routePort,lookup:undefined};
+                    args[0] = config.routeCandidates ? {...options,port:config.routePort,lookup:(_host,lookupOptions,callback)=>callback(null,config.routeCandidates)} : {...options,host:'127.0.0.1',port:config.routePort,lookup:undefined};
                 }
                 return connect.apply(this,args);
             };
@@ -146,7 +256,8 @@ async function child(options, { ca, mode = 'network', directory } = {}) {
                     output={ok:true,status:response.statusCode,body:await readLimited(response)};
                 } finally { clearTimeout(abortTimer); }
             }
-        } catch(error) { output={ok:false,code:error.code || error.message}; }
+        } catch(error) { output={ok:false,code:error.code || error.message,...(config.includeNetwork?{network:error.network}: {})}; }
+        if(config.waitAfter) await new Promise(resolve=>setTimeout(resolve,config.waitAfter));
         console.log(JSON.stringify({...output,dnsCalls,...(config.routePort ? {routed} : {})}));
     `;
     const env = { ...process.env };
@@ -288,7 +399,7 @@ test('official OpenAI direct route supports only the common DNS Fake-IP pool wit
             const result = await child({ dnsAnswers, routePort: fixture.targetPort }, { ca: certs.ca });
             assert.deepEqual(result, {
                 ok: true, status: 200, body: '{"ok":true}', dnsCalls: 1,
-                routed: [{ host: 'api.openai.com', port: 443, addresses: [dnsAnswers[0]] }],
+                routed: [{ host: 'api.openai.com', port: 443, addresses: dnsAnswers }],
             });
             assert.equal(fixture.requests.length, 1);
             assert.equal(fixture.requests[0].headers.host, 'api.openai.com');

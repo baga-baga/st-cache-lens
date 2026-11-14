@@ -1,6 +1,7 @@
 /** Read-only summaries of already-recorded Agent failures. No network or generation. */
 import { safeAuditFailure } from './agent-audit.js';
 import { numericUsage } from './reporting.js';
+import { networkDiagnosticText, isTransportFailureCode } from '../core/network-diagnostics.js';
 
 const MAX_HISTORY = 200;
 const MAX_FAILURES = 10;
@@ -45,7 +46,7 @@ export function sanitizeAgentHistory(records, status) {
         recentFailures: failures.slice(-MAX_FAILURES).reverse().map(record => {
             const result = {
                 time: timestamp(record.time), status: 'failed',
-                failure: safeAuditFailure({ code: record.error }, { stage: 'server-record' }),
+                failure: safeAuditFailure({ code: record.error, network: record.network }, { stage: 'server-record' }),
                 usage: boundedUsage(record.usage),
                 actualCost: amount(record.actualCost), reservedCost: amount(record.reservedCost),
                 currency: currency(record.currency),
@@ -61,8 +62,9 @@ export function sanitizeAgentHistory(records, status) {
 
 /** Fixed messages only. Do not render upstream prose, local exception text or keys. */
 export function auditFailureMessage(failure) {
-    const safe = safeAuditFailure({ code: failure?.code, httpStatus: failure?.httpStatus }, { stage: failure?.stage });
+    const safe = safeAuditFailure({ code: failure?.code, httpStatus: failure?.httpStatus, network: failure?.network }, { stage: failure?.stage });
     const code = safe.code;
+    if (safe.network && isTransportFailureCode(code)) return networkDiagnosticText(safe.network);
     const messages = {
         AGENT_HTTP_400: '服务商返回 400，未接受生成请求；具体原因未包含在这份记录中。连接检查通过不代表生成请求可用。',
         AGENT_HTTP_401: '生成接口拒绝密钥（401）。请核对已保存的接口和密钥；这不是缓存或世界书问题。',
@@ -82,6 +84,7 @@ export function auditFailureMessage(failure) {
         RESPONSE_TOO_LARGE: '接口响应超过本插件读取上限，已停止读取；此前请求仍可能计费。',
         LOCAL_OPERATION_TIMEOUT: '前端等待超时，后续调用已停止；服务端此前的请求仍可能继续完成并计费。',
         UPSTREAM_TIMEOUT: '服务端等待上游响应超时；不能据此判断上游是否已经计费。',
+        UPSTREAM_ABORTED: '服务端上游请求已停止；已发送的请求仍可能计费，未自动重试。',
         PROXY_TIMEOUT: '本机代理连接或响应超时；未自动重试。',
         LOCAL_OPERATION_ABORTED: '本次前端等待已停止；已经发出的请求仍可能计费。',
         PROXY_ABORTED: '本机代理请求已停止；是否计费需看服务端记录。',
@@ -116,7 +119,7 @@ export function agentHistorySummary(history) {
     if (!failures.length) lines.push('最近记录中没有已完成的失败记录；记录可能尚未写入或已被清理，这不证明此前请求没有计费。');
     for (const [index, record] of failures.entries()) {
         const time = timestamp(record?.time);
-        const failure = safeAuditFailure({ code: record?.failure?.code }, { stage: 'server-record' });
+        const failure = safeAuditFailure({ code: record?.failure?.code, network: record?.failure?.network }, { stage: 'server-record' });
         lines.push(`${index + 1}. ${time || '时间未知'} · ${failure.code}\n${auditFailureMessage(failure)}`);
         const cost = amount(record?.actualCost), reserved = amount(record?.reservedCost), unit = currency(record?.currency);
         if (cost !== null && unit) lines.push(`按 usage 与配置价格计算：${cost} ${unit}；不是平台账单。`);

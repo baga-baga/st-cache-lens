@@ -277,7 +277,8 @@ test('unsaved Agent check sends only GET model query, uploads no diagnostic and 
     const after = await service.status();
     assert.deepEqual(after.ledger, before.ledger); assert.equal(after.configured, false); assert.deepEqual(service.state.records, []);
     await assert.rejects(fs.access(path.join(directory, '.cache-lens/server-state.json')), { code: 'ENOENT' });
-    assert.equal(after.serverVersion, '0.1.9'); assert.equal(after.capabilities.agentCheck, true);
+    assert.equal(after.serverVersion, '0.1.11'); assert.equal(after.capabilities.agentCheck, true);
+    assert.equal(after.capabilities.networkDiagnostics, true);
     assert.deepEqual(after.capabilities.agentCheckInterfaces, ['openai']);
 });
 

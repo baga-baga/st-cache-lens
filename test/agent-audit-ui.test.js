@@ -31,7 +31,7 @@ function response(payload, i, operations = []) {
     return { proposal: { expectedVersion: payload.proposalContext.expectedVersion, reason: '已检查设置；真实服务端缓存仍需实际证据。', operations }, record: { id: `audit-paid-${i}`, model: 'synthetic-agent', provider: 'openai', interfaceType: 'openai', time: '2026-11-13T08:05:00.000Z', status: 'completed', usage: { prompt_tokens: 20, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 0 } }, prices, actualCost: 0.00003 } };
 }
 let serial = 0;
-async function harness({ budget = true, agentReply, collector, agentError = null, agentRecords = [], historyError = false, invalidAgentJSON = false } = {}) {
+async function harness({ budget = true, agentReply, collector, agentError = null, agentNetwork = null, agentRecords = [], historyError = false, invalidAgentJSON = false } = {}) {
     const f = fixture(), dom = new JSDOM('<div id="extensions_settings2"></div>', { url: 'http://localhost:8000' });
     const descriptors = {}, fetches = [], paid = [], locks = { request: async (_name, options, callback) => (callback || options)() };
     const globals = { document: dom.window.document, window: dom.window, localStorage: dom.window.localStorage, navigator: { locks },
@@ -48,7 +48,7 @@ async function harness({ budget = true, agentReply, collector, agentError = null
             else if (route === 'agent') {
                 const payload = JSON.parse(options.body); paid.push(payload);
                 if(invalidAgentJSON)return {ok:true,status:200,json:async()=>{throw new Error('synthetic private response body');}};
-                if(agentError)return {ok:false,status:502,json:async()=>({error:agentError})};
+                if(agentError)return {ok:false,status:502,json:async()=>({error:agentError,network:agentNetwork})};
                 result = agentReply ? await agentReply(payload, paid.length) : response(payload, paid.length);
             } else throw new Error(`Unexpected network operation: ${route}`);
             return { ok: true, status: 200, json: async () => structuredClone(result) };
@@ -115,6 +115,32 @@ test('paid audit exports bounded server error and stage, with no automatic retry
         assert.equal(result.failure.stage,'page-call');assert.equal(result.failure.page,1);
         assert.equal(h.paid.length,1);assert.match(h.q('[data-id="auditResult"]').textContent,/AGENT_HTTP_400/);
         assert.doesNotMatch(h.q('[data-id="auditProgress"]').textContent,/已发生调用仍计费/);
+    }finally{await h.close();}
+});
+
+test('audit network failure shows safe transport reason and exports it without retry or application',async()=>{
+    const network={version:1,reason:'ECONNRESET',phase:'wait-headers',route:'direct',requestMayHaveBeenSent:true,responseHeadersReceived:false,elapsedMs:1723};
+    const h=await harness({agentError:'UPSTREAM_CONNECTION_FAILED',agentNetwork:{...network,message:'synthetic-private-error',address:'192.0.2.1',headers:{authorization:'synthetic-key'}}});
+    try{
+        h.click('batch-agent');await h.done();
+        const result=h.panel.getAgentAudit();
+        assert.equal(result.reason,'AUDIT_STOPPED_AFTER_ERROR');assert.equal(result.calls,1);
+        assert.deepEqual(result.failure.network,network);assert.equal(result.failure.stage,'page-call');
+        assert.equal(h.paid.length,1);assert.equal(result.selectedCandidateId,null);
+        assert.match(h.q('[data-id="auditResult"]').textContent,/ECONNRESET/);
+        assert.match(h.q('[data-id="auditResult"]').textContent,/等待 API 响应/);
+        assert.doesNotMatch(JSON.stringify(result),/synthetic-private-error|192\.0\.2\.1|synthetic-key/);
+    }finally{await h.close();}
+});
+
+test('free recovery renders a network cause with zero budget and only reads existing records',async()=>{
+    const network={version:1,reason:'ENETUNREACH',phase:'connect',route:'direct',requestMayHaveBeenSent:false,responseHeadersReceived:false,elapsedMs:17};
+    const h=await harness({budget:false,agentRecords:[{status:'failed',error:'UPSTREAM_CONNECTION_FAILED',network}]});
+    try{
+        h.click('audit-recover');await waitFor(()=>!h.q('[data-action="audit-recover"]').disabled,'network history read');
+        assert.deepEqual(h.panel.getAgentAudit().recovery.history.recentFailures[0].failure.network,network);
+        assert.match(h.q('[data-id="auditResult"]').textContent,/ENETUNREACH/);
+        assert.equal(h.paid.length,0);assert.ok(h.fetches.every(f=>f.options.method==='GET'));
     }finally{await h.close();}
 });
 

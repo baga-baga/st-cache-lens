@@ -1,5 +1,6 @@
 import { AgentService } from './agent.mjs';
 import { ServiceError } from './network.mjs';
+import { sanitizeNetworkDiagnostic } from '../core/network-diagnostics.js';
 
 export const info = {
     id: 'cache-lens',
@@ -24,7 +25,10 @@ function route(action, maxBodyBytes = 65536) {
             response.json(await action(service, request));
         } catch (error) {
             // Never reflect upstream errors, user text, endpoints, request headers or keys.
-            response.status(error instanceof ServiceError ? error.status : 500).json({ error: error instanceof ServiceError ? error.code : 'CACHE_LENS_SERVER_ERROR' });
+            const body = { error: error instanceof ServiceError ? error.code : 'CACHE_LENS_SERVER_ERROR' };
+            const network = error instanceof ServiceError ? sanitizeNetworkDiagnostic(error.network) : null;
+            if (network) body.network = network;
+            response.status(error instanceof ServiceError ? error.status : 500).json(body);
         }
     };
 }
